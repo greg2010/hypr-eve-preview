@@ -1,0 +1,182 @@
+[
+  {
+    "address": "0x5608ab929d00",
+    "mapped": true,
+    "hidden": false,
+    "visible": true,
+    "acceptsInput": true,
+    "at": [
+      0,
+      34
+    ],
+    "size": [
+      2560,
+      1406
+    ],
+    "workspace": {
+      "id": -1340,
+      "name": "EVE2"
+    },
+    "floating": false,
+    "monitor": 2,
+    "class": "steam_app_8500",
+    "title": "EVE",
+    "initialClass": "steam_app_8500",
+    "initialTitle": "EVE",
+    "pid": 496510,
+    "xwayland": true,
+    "pinned": false,
+    "pinFullscreened": false,
+    "fullscreen": 0,
+    "fullscreenClient": 0,
+    "fullscreenHandler": "default",
+    "allowedOverFullscreen": true,
+    "grouped": [],
+    "tags": [
+      "eveClient*"
+    ],
+    "swallowing": "0x0",
+    "focusHistoryID": 7,
+    "inhibitingIdle": false,
+    "xdgTag": "",
+    "xdgDescription": "",
+    "contentType": "none",
+    "tearingHint": false,
+    "stableId": "180001e7"
+  },
+  {
+    "address": "0x5608ab8fee80",
+    "mapped": true,
+    "hidden": false,
+    "visible": true,
+    "acceptsInput": true,
+    "at": [
+      0,
+      34
+    ],
+    "size": [
+      2560,
+      1406
+    ],
+    "workspace": {
+      "id": -1337,
+      "name": "EVE3"
+    },
+    "floating": true,
+    "monitor": 2,
+    "class": "steam_app_8500",
+    "title": "EVE",
+    "initialClass": "steam_app_8500",
+    "initialTitle": "EVE",
+    "pid": 488284,
+    "xwayland": true,
+    "pinned": false,
+    "pinFullscreened": false,
+    "fullscreen": 1,
+    "fullscreenClient": 0,
+    "fullscreenHandler": "default",
+    "allowedOverFullscreen": true,
+    "grouped": [],
+    "tags": [
+      "eveClient*"
+    ],
+    "swallowing": "0x0",
+    "focusHistoryID": 6,
+    "inhibitingIdle": false,
+    "xdgTag": "",
+    "xdgDescription": "",
+    "contentType": "none",
+    "tearingHint": false,
+    "stableId": "180001dd"
+  },
+  {
+    "address": "0x5608ab8d7830",
+    "mapped": true,
+    "hidden": false,
+    "visible": true,
+    "acceptsInput": true,
+    "at": [
+      683,
+      261
+    ],
+    "size": [
+      1624,
+      969
+    ],
+    "workspace": {
+      "id": 4,
+      "name": "Games"
+    },
+    "floating": false,
+    "monitor": 2,
+    "class": "steam_app_8500",
+    "title": "EVE Launcher",
+    "initialClass": "steam_app_8500",
+    "initialTitle": "EVE",
+    "pid": 435942,
+    "xwayland": true,
+    "pinned": false,
+    "pinFullscreened": false,
+    "fullscreen": 0,
+    "fullscreenClient": 0,
+    "fullscreenHandler": "default",
+    "allowedOverFullscreen": true,
+    "grouped": [],
+    "tags": [
+      "eveClient*"
+    ],
+    "swallowing": "0x0",
+    "focusHistoryID": 7,
+    "inhibitingIdle": false,
+    "xdgTag": "",
+    "xdgDescription": "",
+    "contentType": "none",
+    "tearingHint": false,
+    "stableId": "180001e7"
+  },
+  {
+    "address": "0x5608ab796170",
+    "mapped": true,
+    "hidden": false,
+    "visible": true,
+    "acceptsInput": true,
+    "at": [
+      3,
+      29
+    ],
+    "size": [
+      107,
+      13
+    ],
+    "workspace": {
+      "id": 4,
+      "name": "Games"
+    },
+    "floating": false,
+    "monitor": 2,
+    "class": "steam_app_8500",
+    "title": "",
+    "initialClass": "steam_app_8500",
+    "initialTitle": "EVE",
+    "pid": 435862,
+    "xwayland": true,
+    "pinned": false,
+    "pinFullscreened": false,
+    "fullscreen": 0,
+    "fullscreenClient": 0,
+    "fullscreenHandler": "default",
+    "allowedOverFullscreen": true,
+    "grouped": [],
+    "tags": [
+      "eveClient*"
+    ],
+    "swallowing": "0x0",
+    "focusHistoryID": 7,
+    "inhibitingIdle": false,
+    "xdgTag": "",
+    "xdgDescription": "",
+    "contentType": "none",
+    "tearingHint": false,
+    "stableId": "180001e7"
+  }
+]
