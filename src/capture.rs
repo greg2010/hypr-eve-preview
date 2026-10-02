@@ -11,6 +11,63 @@ pub const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// Number of buffers the thumbnail alternates between.
 pub const SLOTS: usize = 2;
 
+/// The screencopy frame a client holds. `Answered` has delivered its event, so `teardown`
+/// destroys it; `Unanswered` has not, so `teardown` orphans it instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldFrame {
+    None,
+    Answered,
+    Unanswered,
+}
+
+/// The capture resources one client holds when it is torn down. `teardown` turns the record
+/// into a plan; `buffers[slot]` is true while that slot's buffer exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    pub timer: bool,
+    pub frame: HeldFrame,
+    pub overlay: bool,
+    pub buffers: [bool; SLOTS],
+}
+
+/// One destruction step. The caller executes the steps in the order `teardown` returns them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Teardown {
+    CancelTimer,
+    DestroyFrame,
+    OrphanFrame,
+    DestroyOverlay,
+    DestroyBuffer { slot: usize },
+    ReleaseImports,
+}
+
+/// The destruction plan of one client's capture resources, in the order that leaves no server
+/// reference to a destroyed buffer: timer, frame, overlay, buffers, imports.
+/// `ReleaseImports` is always present.
+pub fn teardown(held: Held) -> Vec<Teardown> {
+    let mut plan = Vec::new();
+    if held.timer {
+        plan.push(Teardown::CancelTimer);
+    }
+    match held.frame {
+        HeldFrame::None => {}
+        HeldFrame::Answered => plan.push(Teardown::DestroyFrame),
+        HeldFrame::Unanswered => plan.push(Teardown::OrphanFrame),
+    }
+    if held.overlay {
+        plan.push(Teardown::DestroyOverlay);
+    }
+    plan.extend(
+        held.buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| **held)
+            .map(|(slot, _)| Teardown::DestroyBuffer { slot }),
+    );
+    plan.push(Teardown::ReleaseImports);
+    plan
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DmabufInfo {
     pub fourcc: u32,
@@ -825,6 +882,65 @@ mod tests {
             ],
         ));
         steps
+    }
+
+    #[test]
+    fn teardown_cases() {
+        let held = |timer, frame, overlay, buffers| Held {
+            timer,
+            frame,
+            overlay,
+            buffers,
+        };
+        let buffer = |slot| Teardown::DestroyBuffer { slot };
+        let cases: Vec<(&str, Held, Vec<Teardown>)> = vec![
+            (
+                "nothing held",
+                held(false, HeldFrame::None, false, [false; SLOTS]),
+                vec![Teardown::ReleaseImports],
+            ),
+            (
+                "everything held, answered frame",
+                held(true, HeldFrame::Answered, true, [true; SLOTS]),
+                vec![
+                    Teardown::CancelTimer,
+                    Teardown::DestroyFrame,
+                    Teardown::DestroyOverlay,
+                    buffer(0),
+                    buffer(1),
+                    Teardown::ReleaseImports,
+                ],
+            ),
+            (
+                "everything held, unanswered frame",
+                held(true, HeldFrame::Unanswered, true, [true; SLOTS]),
+                vec![
+                    Teardown::CancelTimer,
+                    Teardown::OrphanFrame,
+                    Teardown::DestroyOverlay,
+                    buffer(0),
+                    buffer(1),
+                    Teardown::ReleaseImports,
+                ],
+            ),
+            (
+                "only slot 1 held",
+                held(false, HeldFrame::None, false, [false, true]),
+                vec![buffer(1), Teardown::ReleaseImports],
+            ),
+            (
+                "timer and unanswered frame only",
+                held(true, HeldFrame::Unanswered, false, [false; SLOTS]),
+                vec![
+                    Teardown::CancelTimer,
+                    Teardown::OrphanFrame,
+                    Teardown::ReleaseImports,
+                ],
+            ),
+        ];
+        for (name, held, want) in cases {
+            assert_eq!(teardown(held), want, "teardown_cases/{name}");
+        }
     }
 
     #[test]
