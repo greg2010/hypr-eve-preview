@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use crate::geometry::{Size, thumbnail_size};
-use crate::report::{FailReason, Line};
+use crate::geometry::Size;
+use crate::report::{DamageMode, FailReason, Line};
 
 /// Keeps the copy rate at 30 per second or less.
 pub const MIN_COPY_INTERVAL: Duration = Duration::from_nanos(33_333_334);
@@ -15,12 +15,6 @@ pub const SLOTS: usize = 2;
 pub struct DmabufInfo {
     pub fourcc: u32,
     pub size: Size,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DamageMode {
-    Recommit,
-    IgnoreDamage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +31,11 @@ pub enum Input {
     Wake,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     RequestFrame,
     CreateOverlay {
-        size: Size,
+        buffer_size: Size,
     },
     Allocate {
         slot: usize,
@@ -59,12 +53,14 @@ pub enum Action {
     Present {
         slot: usize,
         buffer_size: Size,
-        size: Size,
         y_invert: bool,
     },
     DestroyFrame,
     WakeAt(Instant),
     Report(Line),
+    Remove {
+        reason: String,
+    },
     Exit {
         code: u8,
         reason: String,
@@ -110,7 +106,6 @@ enum OverlayState {
 /// The frame and buffer state machine. It does no I/O: the caller feeds inputs with the current
 /// time and executes the returned actions in order.
 pub struct Capture {
-    width: u32,
     mode: DamageMode,
     address: u64,
     handle: u32,
@@ -126,10 +121,9 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// `address` and `handle` only appear in the exit reason of a missing window.
-    pub fn new(width: u32, mode: DamageMode, address: u64, handle: u32) -> Capture {
+    /// `handle` only appears in the removal reason of a missing window.
+    pub fn new(mode: DamageMode, address: u64, handle: u32) -> Capture {
         Capture {
-            width,
             mode,
             address,
             handle,
@@ -172,8 +166,7 @@ impl Capture {
                     }];
                 };
                 if info.size.width == 0 || info.size.height == 0 {
-                    return vec![Action::Exit {
-                        code: 1,
+                    return vec![Action::Remove {
                         reason: format!(
                             "frame size {}x{} has a zero dimension",
                             info.size.width, info.size.height
@@ -187,8 +180,7 @@ impl Capture {
                 if self.frame != Frame::Requested {
                     return vec![];
                 }
-                vec![Action::Exit {
-                    code: 1,
+                vec![Action::Remove {
                     reason: format!(
                         "window 0x{:x} not found by hyprland_toplevel_export_manager_v1 (handle {})",
                         self.address, self.handle
@@ -267,7 +259,10 @@ impl Capture {
         let target = self.target();
         if self.slots[target] == SlotState::Displaced {
             self.wait = Some((target, now));
-            return vec![Action::Report(Line::ReleaseWait { slot: target })];
+            return vec![Action::Report(Line::ReleaseWait {
+                address: self.address,
+                slot: target,
+            })];
         }
         self.seq += 1;
         self.y_invert = false;
@@ -293,7 +288,7 @@ impl Capture {
                 buffers: [record; SLOTS],
             };
             let mut actions = vec![Action::CreateOverlay {
-                size: thumbnail_size(self.width, info.size),
+                buffer_size: info.size,
             }];
             actions.extend((0..SLOTS).map(allocate));
             return actions;
@@ -361,6 +356,7 @@ impl Capture {
         let earliest = self.earliest().unwrap_or(now);
         vec![
             Action::Report(Line::Ready {
+                address: self.address,
                 seq: self.seq,
                 slot,
                 tv_sec,
@@ -370,7 +366,6 @@ impl Capture {
             Action::Present {
                 slot,
                 buffer_size: size,
-                size: thumbnail_size(self.width, size),
                 y_invert: self.y_invert,
             },
             Action::DestroyFrame,
@@ -388,14 +383,14 @@ impl Capture {
         let mut actions = vec![
             Action::DestroyFrame,
             Action::Report(Line::Failed {
+                address: self.address,
                 seq: self.seq,
                 reason,
                 consecutive: self.failures,
             }),
         ];
         if self.failures >= MAX_CONSECUTIVE_FAILURES {
-            actions.push(Action::Exit {
-                code: 1,
+            actions.push(Action::Remove {
                 reason: format!("{MAX_CONSECUTIVE_FAILURES} consecutive capture failures"),
             });
         } else {
@@ -420,6 +415,7 @@ impl Capture {
         }
         self.wait = None;
         let mut actions = vec![Action::Report(Line::Released {
+            address: self.address,
             slot,
             waited: now.saturating_duration_since(start),
         })];
@@ -432,16 +428,12 @@ impl Capture {
 mod tests {
     use super::*;
 
-    const ADDRESS: u64 = 0x5608ab929d00;
-    const HANDLE: u32 = 2878512384;
+    const ADDRESS: u64 = 0x555512345678;
+    const HANDLE: u32 = 305419896;
     const AR24: u32 = 0x34325241;
     const SIZE: Size = Size {
         width: 3840,
         height: 2109,
-    };
-    const THUMB: Size = Size {
-        width: 480,
-        height: 264,
     };
     const MODES: [DamageMode; 2] = [DamageMode::Recommit, DamageMode::IgnoreDamage];
 
@@ -460,7 +452,7 @@ mod tests {
     }
 
     fn run(name: &str, mode: DamageMode, t0: Instant, steps: Vec<Step>) -> Capture {
-        let mut cap = Capture::new(480, mode, ADDRESS, HANDLE);
+        let mut cap = Capture::new(mode, ADDRESS, HANDLE);
         for (i, s) in steps.into_iter().enumerate() {
             let got = cap.handle(s.input.clone(), t0 + s.at);
             assert_eq!(got, s.want, "{name} ({mode:?}) step {i}: {:?}", s.input);
@@ -492,6 +484,7 @@ mod tests {
 
     fn ready_line(seq: u64, slot: usize, copy_to_ready: Duration) -> Action {
         Action::Report(Line::Ready {
+            address: ADDRESS,
             seq,
             slot,
             tv_sec: 100,
@@ -507,11 +500,10 @@ mod tests {
         }
     }
 
-    fn present(slot: usize, buffer_size: Size, size: Size, y_invert: bool) -> Action {
+    fn present(slot: usize, buffer_size: Size, y_invert: bool) -> Action {
         Action::Present {
             slot,
             buffer_size,
-            size,
             y_invert,
         }
     }
@@ -524,7 +516,7 @@ mod tests {
                 ms(1),
                 describe(SIZE),
                 vec![
-                    Action::CreateOverlay { size: THUMB },
+                    Action::CreateOverlay { buffer_size: SIZE },
                     allocate(0, SIZE),
                     allocate(1, SIZE),
                 ],
@@ -548,7 +540,7 @@ mod tests {
                 ready_input(),
                 vec![
                     ready_line(1, 0, ms(10)),
-                    present(0, SIZE, THUMB, false),
+                    present(0, SIZE, false),
                     Action::DestroyFrame,
                     at(t0, ms(4) + MIN_COPY_INTERVAL),
                 ],
@@ -600,7 +592,7 @@ mod tests {
                 ready_input(),
                 vec![
                     ready_line(2, 1, ms(10)),
-                    present(1, SIZE, THUMB, false),
+                    present(1, SIZE, false),
                     Action::DestroyFrame,
                     at(t0, copy + MIN_COPY_INTERVAL),
                 ],
@@ -619,13 +611,17 @@ mod tests {
             step(
                 wake,
                 Input::Wake,
-                vec![Action::Report(Line::ReleaseWait { slot: 0 })],
+                vec![Action::Report(Line::ReleaseWait {
+                    address: ADDRESS,
+                    slot: 0,
+                })],
             ),
             step(
                 wake + ms(120),
                 Input::Released { slot: 0 },
                 vec![
                     Action::Report(Line::Released {
+                        address: ADDRESS,
                         slot: 0,
                         waited: ms(120),
                     }),
@@ -666,7 +662,7 @@ mod tests {
                             ms(1),
                             describe(SIZE),
                             vec![
-                                Action::CreateOverlay { size: THUMB },
+                                Action::CreateOverlay { buffer_size: SIZE },
                                 allocate(0, SIZE),
                                 allocate(1, SIZE),
                             ],
@@ -719,15 +715,14 @@ mod tests {
                     ]),
                 ),
                 (
-                    "frame_missing_exits",
+                    "frame_missing_removes",
                     vec![
                         step(ms(0), Input::Start, vec![Action::RequestFrame]),
                         step(
                             ms(1),
                             Input::FrameMissing,
-                            vec![Action::Exit {
-                                code: 1,
-                                reason: "window 0x5608ab929d00 not found by hyprland_toplevel_export_manager_v1 (handle 2878512384)".to_string(),
+                            vec![Action::Remove {
+                                reason: "window 0x555512345678 not found by hyprland_toplevel_export_manager_v1 (handle 305419896)".to_string(),
                             }],
                         ),
                     ],
@@ -747,11 +742,11 @@ mod tests {
                     ],
                 ),
                 (
-                    "zero_width_frame_exits",
+                    "zero_width_frame_removes",
                     zero_frame_script(0, 1406),
                 ),
                 (
-                    "zero_height_frame_exits",
+                    "zero_height_frame_removes",
                     zero_frame_script(3840, 0),
                 ),
                 (
@@ -765,6 +760,7 @@ mod tests {
                             vec![
                                 Action::DestroyFrame,
                                 Action::Report(Line::Failed {
+                                    address: ADDRESS,
                                     seq: 1,
                                     reason: FailReason::Failed,
                                     consecutive: 1,
@@ -808,8 +804,7 @@ mod tests {
             step(
                 ms(1),
                 describe(Size { width, height }),
-                vec![Action::Exit {
-                    code: 1,
+                vec![Action::Remove {
                     reason: format!("frame size {width}x{height} has a zero dimension"),
                 }],
             ),
@@ -824,7 +819,7 @@ mod tests {
             ready_input(),
             vec![
                 ready_line(1, 0, ms(10)),
-                present(0, SIZE, THUMB, y_invert),
+                present(0, SIZE, y_invert),
                 Action::DestroyFrame,
                 at(t0, ms(4) + MIN_COPY_INTERVAL),
             ],
@@ -904,10 +899,6 @@ mod tests {
             width: 3840,
             height: 2000,
         };
-        let new_thumb = Size {
-            width: 480,
-            height: 250,
-        };
         for mode in MODES {
             let t0 = Instant::now();
             let wake = ms(4) + MIN_COPY_INTERVAL;
@@ -931,7 +922,7 @@ mod tests {
                         ready_input(),
                         vec![
                             ready_line(2, 1, ms(10)),
-                            present(1, new_size, new_thumb, false),
+                            present(1, new_size, false),
                             Action::DestroyFrame,
                             at(t0, imported + MIN_COPY_INTERVAL),
                         ],
@@ -952,13 +943,17 @@ mod tests {
                             step(
                                 wake2,
                                 Input::Wake,
-                                vec![Action::Report(Line::ReleaseWait { slot: 0 })],
+                                vec![Action::Report(Line::ReleaseWait {
+                                    address: ADDRESS,
+                                    slot: 0,
+                                })],
                             ),
                             step(
                                 wake2 + ms(120),
                                 Input::Released { slot: 0 },
                                 vec![
                                     Action::Report(Line::Released {
+                                        address: ADDRESS,
                                         slot: 0,
                                         waited: ms(120),
                                     }),
@@ -983,6 +978,7 @@ mod tests {
 
     fn failed_line(seq: u64, consecutive: u32, reason: FailReason) -> Action {
         Action::Report(Line::Failed {
+            address: ADDRESS,
             seq,
             reason,
             consecutive,
@@ -1049,7 +1045,7 @@ mod tests {
                                 wake + ms(1),
                                 describe(SIZE),
                                 vec![
-                                    Action::CreateOverlay { size: THUMB },
+                                    Action::CreateOverlay { buffer_size: SIZE },
                                     allocate(0, SIZE),
                                     allocate(1, SIZE),
                                 ],
@@ -1074,7 +1070,7 @@ mod tests {
                                 ready_input(),
                                 vec![
                                     ready_line(5, 0, ms(10)),
-                                    present(0, SIZE, THUMB, false),
+                                    present(0, SIZE, false),
                                     Action::DestroyFrame,
                                     at(t0, wake + ms(4) + MIN_COPY_INTERVAL),
                                 ],
@@ -1094,7 +1090,7 @@ mod tests {
                     [SlotState::OnScreen, SlotState::Free],
                 ),
                 (
-                    "five_failures_exit",
+                    "five_failures_remove",
                     join(vec![
                         four_failures(t0),
                         vec![
@@ -1105,8 +1101,7 @@ mod tests {
                                 vec![
                                     Action::DestroyFrame,
                                     failed_line(5, 5, FailReason::Failed),
-                                    Action::Exit {
-                                        code: 1,
+                                    Action::Remove {
                                         reason: "5 consecutive capture failures".to_string(),
                                     },
                                 ],
