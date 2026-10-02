@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
-use crate::geometry::{Point, Size};
+use crate::geometry::{Point, Rect, Size};
 
 pub const SAVE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -22,10 +22,33 @@ pub struct Entry {
     pub width: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(transparent)]
+/// The layout file: the `locked` and `snapping` flags and an optional base thumbnail `opacity`
+/// (percent) beside one `Entry` per account key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LayoutFile {
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default = "snapping_default")]
+    pub snapping: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<u32>,
+    #[serde(flatten)]
     pub entries: BTreeMap<String, Entry>,
+}
+
+fn snapping_default() -> bool {
+    true
+}
+
+impl Default for LayoutFile {
+    fn default() -> Self {
+        LayoutFile {
+            locked: false,
+            snapping: snapping_default(),
+            opacity: None,
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -34,6 +57,7 @@ pub enum LayoutError {
     Json(serde_json::Error),
     Write(std::io::Error),
     Rename(std::io::Error),
+    Opacity(u32),
 }
 
 impl fmt::Display for LayoutError {
@@ -43,6 +67,11 @@ impl fmt::Display for LayoutError {
                 write!(f, "{e}")
             }
             LayoutError::Json(e) => write!(f, "{e}"),
+            LayoutError::Opacity(n) => write!(
+                f,
+                "opacity {n}: must be between 0 and {}",
+                config::MAX_OPACITY
+            ),
         }
     }
 }
@@ -65,7 +94,11 @@ pub fn load(path: &Path) -> Result<LayoutFile, LayoutError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LayoutFile::default()),
         Err(e) => return Err(LayoutError::Read(e)),
     };
-    serde_json::from_str(&text).map_err(LayoutError::Json)
+    let file: LayoutFile = serde_json::from_str(&text).map_err(LayoutError::Json)?;
+    match file.opacity {
+        Some(n) if n > config::MAX_OPACITY => Err(LayoutError::Opacity(n)),
+        _ => Ok(file),
+    }
 }
 
 /// Renames `path` to `layout.json.bad` in the same directory, replacing an older one, and
@@ -116,6 +149,51 @@ pub fn clamp_position(x: i64, y: i64, size: Size, usable: Size) -> Point {
         x: fit(x, size.width, usable.width),
         y: fit(y, size.height, usable.height),
     }
+}
+
+/// Snaps each axis of `origin` to the nearest usable-area or neighbour edge within `distance`.
+/// A tie goes to the smaller coordinate. The result is not clamped.
+pub fn snap(
+    origin: (i64, i64),
+    size: Size,
+    others: &[Rect],
+    usable: Size,
+    distance: u32,
+) -> (i64, i64) {
+    let axis =
+        |origin: i64, extent: u32, bound: u32, spans: &mut dyn Iterator<Item = (u32, u32)>| {
+            let extent = i64::from(extent);
+            let mut candidates = vec![0, i64::from(bound) - extent];
+            for (start, length) in spans {
+                let (start, length) = (i64::from(start), i64::from(length));
+                candidates.extend([
+                    start,
+                    start + length,
+                    start - extent,
+                    start + length - extent,
+                ]);
+            }
+            candidates
+                .into_iter()
+                .map(|c| ((c - origin).abs(), c))
+                .filter(|(gap, _)| *gap <= i64::from(distance))
+                .min()
+                .map_or(origin, |(_, c)| c)
+        };
+    (
+        axis(
+            origin.0,
+            size.width,
+            usable.width,
+            &mut others.iter().map(|o| (o.x, o.width)),
+        ),
+        axis(
+            origin.1,
+            size.height,
+            usable.height,
+            &mut others.iter().map(|o| (o.y, o.height)),
+        ),
+    )
 }
 
 pub fn default_position(index: usize, placement: &config::Placement, width: u32) -> (i64, i64) {
@@ -203,6 +281,9 @@ mod tests {
 
     fn file(entries: &[(&str, Entry)]) -> LayoutFile {
         LayoutFile {
+            locked: false,
+            snapping: true,
+            opacity: None,
             entries: entries
                 .iter()
                 .map(|(k, e)| ((*k).to_string(), *e))
@@ -228,6 +309,8 @@ mod tests {
             width: 480,
             min_width: 160,
             max_width: 1280,
+            opacity: 0,
+            snap_distance: 0,
         }
     }
 
@@ -284,16 +367,244 @@ mod tests {
     }
 
     #[test]
+    fn snap_cases() {
+        let size = Size {
+            width: 480,
+            height: 264,
+        };
+        let n = Rect {
+            x: 1000,
+            y: 400,
+            width: 320,
+            height: 176,
+        };
+        let m = Rect {
+            x: 1310,
+            y: 900,
+            width: 200,
+            height: 100,
+        };
+        let cases = [
+            ("usable left", (6, 500), vec![], 10, (0, 500)),
+            ("usable right", (2075, 500), vec![], 10, (2080, 500)),
+            ("usable top", (1000, 9), vec![], 10, (1000, 0)),
+            ("usable bottom", (1000, 1135), vec![], 10, (1000, 1142)),
+            ("left on left", (1004, 50), vec![n], 10, (1000, 50)),
+            ("left against right", (1315, 50), vec![n], 10, (1320, 50)),
+            ("right against left", (528, 50), vec![n], 10, (520, 50)),
+            ("right on right", (845, 50), vec![n], 10, (840, 50)),
+            ("top on top", (1700, 405), vec![n], 10, (1700, 400)),
+            ("top against bottom", (1700, 570), vec![n], 10, (1700, 576)),
+            ("bottom against top", (1700, 130), vec![n], 10, (1700, 136)),
+            ("bottom on bottom", (1700, 318), vec![n], 10, (1700, 312)),
+            ("at the distance", (1010, 50), vec![n], 10, (1000, 50)),
+            (
+                "usable left at distance + 1",
+                (11, 500),
+                vec![],
+                10,
+                (11, 500),
+            ),
+            (
+                "usable right at distance + 1",
+                (2069, 500),
+                vec![],
+                10,
+                (2069, 500),
+            ),
+            (
+                "usable top at distance + 1",
+                (1000, 11),
+                vec![],
+                10,
+                (1000, 11),
+            ),
+            (
+                "usable bottom at distance + 1",
+                (1000, 1131),
+                vec![],
+                10,
+                (1000, 1131),
+            ),
+            (
+                "left on left at distance + 1",
+                (1011, 50),
+                vec![n],
+                10,
+                (1011, 50),
+            ),
+            (
+                "left against right at distance + 1",
+                (1309, 50),
+                vec![n],
+                10,
+                (1309, 50),
+            ),
+            (
+                "right against left at distance + 1",
+                (531, 50),
+                vec![n],
+                10,
+                (531, 50),
+            ),
+            (
+                "right on right at distance + 1",
+                (851, 50),
+                vec![n],
+                10,
+                (851, 50),
+            ),
+            (
+                "top on top at distance + 1",
+                (1700, 411),
+                vec![n],
+                10,
+                (1700, 411),
+            ),
+            (
+                "top against bottom at distance + 1",
+                (1700, 565),
+                vec![n],
+                10,
+                (1700, 565),
+            ),
+            (
+                "bottom against top at distance + 1",
+                (1700, 125),
+                vec![n],
+                10,
+                (1700, 125),
+            ),
+            (
+                "bottom on bottom at distance + 1",
+                (1700, 323),
+                vec![n],
+                10,
+                (1700, 323),
+            ),
+            ("distance 0 never snaps", (1004, 50), vec![n], 0, (1004, 50)),
+            ("nearest wins", (1316, 50), vec![n, m], 10, (1320, 50)),
+            (
+                "tie goes to the lower coordinate",
+                (1315, 50),
+                vec![n, m],
+                10,
+                (1310, 50),
+            ),
+            (
+                "x and y snap independently",
+                (1004, 405),
+                vec![n],
+                10,
+                (1000, 400),
+            ),
+            (
+                "a far thumbnail on the other axis still snaps",
+                (1004, 1300),
+                vec![n],
+                10,
+                (1000, 1300),
+            ),
+        ];
+        for (name, origin, others, distance, want) in cases {
+            assert_eq!(
+                snap(origin, size, &others, USABLE, distance),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn file_cases() {
         let tmp = TempDir::new("file");
         let dir = tmp.path().to_path_buf();
         let ok = file(&[("user:1000001", entry(8, 8, 480))]);
-        let cases: [(&str, Option<&str>, Result<LayoutFile, &str>); 7] = [
+        let locked_entry = LayoutFile {
+            locked: true,
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let locked_only = LayoutFile {
+            locked: true,
+            ..LayoutFile::default()
+        };
+        let with_opacity = |n| LayoutFile {
+            opacity: Some(n),
+            ..LayoutFile::default()
+        };
+        let both_keys = LayoutFile {
+            locked: true,
+            opacity: Some(30),
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let snapping_off = LayoutFile {
+            snapping: false,
+            ..LayoutFile::default()
+        };
+        let all_keys = LayoutFile {
+            locked: true,
+            snapping: false,
+            opacity: Some(30),
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let cases: [(&str, Option<&str>, Result<LayoutFile, &str>); 21] = [
             ("missing", None, Ok(LayoutFile::default())),
             (
                 "valid",
                 Some(r#"{"user:1000001":{"x":8,"y":8,"width":480}}"#),
                 Ok(ok),
+            ),
+            (
+                "locked true with an entry",
+                Some(r#"{"locked":true,"user:1000001":{"x":8,"y":8,"width":480}}"#),
+                Ok(locked_entry),
+            ),
+            ("locked only", Some(r#"{"locked":true}"#), Ok(locked_only)),
+            ("locked not a bool", Some(r#"{"locked":1}"#), Err("json")),
+            (
+                "snapping false",
+                Some(r#"{"snapping":false}"#),
+                Ok(snapping_off),
+            ),
+            (
+                "snapping true without other keys",
+                Some(r#"{"snapping":true}"#),
+                Ok(LayoutFile::default()),
+            ),
+            (
+                "snapping not a bool",
+                Some(r#"{"snapping":1}"#),
+                Err("json"),
+            ),
+            (
+                "locked, snapping and opacity with an entry",
+                Some(
+                    r#"{"locked":true,"snapping":false,"opacity":30,"user:1000001":{"x":8,"y":8,"width":480}}"#,
+                ),
+                Ok(all_keys),
+            ),
+            (
+                "opacity 50",
+                Some(r#"{"opacity":50}"#),
+                Ok(with_opacity(50)),
+            ),
+            (
+                "opacity 100",
+                Some(r#"{"opacity":100}"#),
+                Ok(with_opacity(100)),
+            ),
+            ("opacity 0", Some(r#"{"opacity":0}"#), Ok(with_opacity(0))),
+            (
+                "opacity above 100",
+                Some(r#"{"opacity":101}"#),
+                Err("opacity"),
+            ),
+            ("opacity a string", Some(r#"{"opacity":"50"}"#), Err("json")),
+            ("opacity negative", Some(r#"{"opacity":-1}"#), Err("json")),
+            (
+                "locked and opacity with an entry",
+                Some(r#"{"locked":true,"opacity":30,"user:1000001":{"x":8,"y":8,"width":480}}"#),
+                Ok(both_keys),
             ),
             ("not json", Some("not json"), Err("json")),
             ("array", Some("[]"), Err("json")),
@@ -318,6 +629,7 @@ mod tests {
                 LayoutError::Read(e) => format!("read {:?}", e.kind()),
                 LayoutError::Write(_) => "write".to_string(),
                 LayoutError::Rename(_) => "rename".to_string(),
+                LayoutError::Opacity(_) => "opacity".to_string(),
             });
             assert_eq!(got, want.map_err(String::from), "{name}");
         }
@@ -355,6 +667,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn layout_error_display_cases() {
+        let cases = [
+            (
+                LayoutError::Opacity(101),
+                "opacity 101: must be between 0 and 100",
+            ),
+            (LayoutError::Write(io::Error::other("boom")), "boom"),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.to_string(), want);
+        }
+    }
+
     enum SaveStep {
         Save(&'static str, LayoutFile),
         Expect {
@@ -378,10 +704,28 @@ mod tests {
 
     #[test]
     fn save_cases() {
-        let want_text = "{\n  \"character:Pilot Two\": {\n    \"x\": 496,\n    \"y\": 8,\n    \
+        let want_text = "{\n  \"locked\": false,\n  \"snapping\": true,\n  \"character:Pilot Two\": {\n    \"x\": 496,\n    \"y\": 8,\n    \
                          \"width\": 480\n  },\n  \"user:1000001\": {\n    \"x\": 8,\n    \"y\": 8,\n    \
                          \"width\": 480\n  }\n}";
         let again = file(&[("user:1000001", entry(10, 12, 544))]);
+        let locked = LayoutFile {
+            locked: true,
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let locked_text = "{\n  \"locked\": true,\n  \"snapping\": true,\n  \"user:1000001\": {\n    \"x\": 8,\n    \"y\": 8,\n    \
+                           \"width\": 480\n  }\n}";
+        let with_opacity = LayoutFile {
+            opacity: Some(50),
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let opacity_text = "{\n  \"locked\": false,\n  \"snapping\": true,\n  \"opacity\": 50,\n  \"user:1000001\": {\n    \"x\": 8,\n    \"y\": 8,\n    \
+                            \"width\": 480\n  }\n}";
+        let unsnapped = LayoutFile {
+            snapping: false,
+            ..file(&[("user:1000001", entry(8, 8, 480))])
+        };
+        let unsnapped_text = "{\n  \"locked\": false,\n  \"snapping\": false,\n  \"user:1000001\": {\n    \"x\": 8,\n    \"y\": 8,\n    \
+                              \"width\": 480\n  }\n}";
         let cases = [
             (
                 "first save creates the directory with mode 0700",
@@ -407,6 +751,45 @@ mod tests {
                         listing_of: "hypr-eve-preview",
                         listing: vec!["layout.json"],
                         load: again,
+                    },
+                ],
+            ),
+            (
+                "locked true is written first and round-trips",
+                vec![
+                    SaveStep::Save("layout.json", locked.clone()),
+                    SaveStep::Text("layout.json", locked_text),
+                    SaveStep::Expect {
+                        path: "layout.json",
+                        listing_of: ".",
+                        listing: vec!["layout.json"],
+                        load: locked,
+                    },
+                ],
+            ),
+            (
+                "opacity is written after locked and round-trips",
+                vec![
+                    SaveStep::Save("layout.json", with_opacity.clone()),
+                    SaveStep::Text("layout.json", opacity_text),
+                    SaveStep::Expect {
+                        path: "layout.json",
+                        listing_of: ".",
+                        listing: vec!["layout.json"],
+                        load: with_opacity,
+                    },
+                ],
+            ),
+            (
+                "snapping false is written after locked and round-trips",
+                vec![
+                    SaveStep::Save("layout.json", unsnapped.clone()),
+                    SaveStep::Text("layout.json", unsnapped_text),
+                    SaveStep::Expect {
+                        path: "layout.json",
+                        listing_of: ".",
+                        listing: vec!["layout.json"],
+                        load: unsnapped,
                     },
                 ],
             ),
