@@ -40,10 +40,13 @@ impl fmt::Display for IpcError {
 
 impl std::error::Error for IpcError {}
 
+/// Hyprland socket paths under `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/`.
+/// `control` is this tool's own command socket, `.hypr-eve-preview.sock`, in the same directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sockets {
     pub events: PathBuf,
     pub requests: PathBuf,
+    pub control: PathBuf,
 }
 
 pub fn sockets(
@@ -60,6 +63,7 @@ pub fn sockets(
     Ok(Sockets {
         events: dir.join(".socket2.sock"),
         requests: dir.join(".socket.sock"),
+        control: dir.join(".hypr-eve-preview.sock"),
     })
 }
 
@@ -540,6 +544,7 @@ mod tests {
                 Ok(Sockets {
                     events: PathBuf::from("/run/user/1000/hypr/sig/.socket2.sock"),
                     requests: PathBuf::from("/run/user/1000/hypr/sig/.socket.sock"),
+                    control: PathBuf::from("/run/user/1000/hypr/sig/.hypr-eve-preview.sock"),
                 }),
             ),
             ("runtime dir unset", None, os("sig"), Err("XDG_RUNTIME_DIR")),
