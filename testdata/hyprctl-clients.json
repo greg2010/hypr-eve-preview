@@ -1,6 +1,6 @@
 [
   {
-    "address": "0x5608ab929d00",
+    "address": "0x555512345678",
     "mapped": true,
     "hidden": false,
     "visible": true,
@@ -20,10 +20,10 @@
     "floating": false,
     "monitor": 2,
     "class": "steam_app_8500",
-    "title": "EVE",
+    "title": "EVE - Pilot One",
     "initialClass": "steam_app_8500",
     "initialTitle": "EVE",
-    "pid": 496510,
+    "pid": 1001,
     "xwayland": true,
     "pinned": false,
     "pinFullscreened": false,
@@ -45,7 +45,7 @@
     "stableId": "180001e7"
   },
   {
-    "address": "0x5608ab8fee80",
+    "address": "0x55559abcdef0",
     "mapped": true,
     "hidden": false,
     "visible": true,
@@ -68,7 +68,7 @@
     "title": "EVE",
     "initialClass": "steam_app_8500",
     "initialTitle": "EVE",
-    "pid": 488284,
+    "pid": 1002,
     "xwayland": true,
     "pinned": false,
     "pinFullscreened": false,
@@ -90,7 +90,7 @@
     "stableId": "180001dd"
   },
   {
-    "address": "0x5608ab8d7830",
+    "address": "0x555500001000",
     "mapped": true,
     "hidden": false,
     "visible": true,
@@ -113,7 +113,7 @@
     "title": "EVE Launcher",
     "initialClass": "steam_app_8500",
     "initialTitle": "EVE",
-    "pid": 435942,
+    "pid": 1003,
     "xwayland": true,
     "pinned": false,
     "pinFullscreened": false,
@@ -135,7 +135,7 @@
     "stableId": "180001e7"
   },
   {
-    "address": "0x5608ab796170",
+    "address": "0x555500002000",
     "mapped": true,
     "hidden": false,
     "visible": true,
@@ -158,7 +158,7 @@
     "title": "",
     "initialClass": "steam_app_8500",
     "initialTitle": "EVE",
-    "pid": 435862,
+    "pid": 1004,
     "xwayland": true,
     "pinned": false,
     "pinFullscreened": false,
