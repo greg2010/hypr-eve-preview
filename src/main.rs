@@ -7,6 +7,7 @@ mod chrome;
 mod cli;
 mod clients;
 mod config;
+mod control;
 mod dmabuf;
 mod geometry;
 mod hypr;
@@ -18,13 +19,15 @@ mod protocol;
 mod report;
 #[cfg(test)]
 mod testutil;
+mod tray;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use calloop::generic::Generic;
+use calloop::ping::{Ping, make_ping};
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
@@ -56,13 +59,15 @@ use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1;
+use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_v1::WpAlphaModifierV1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1;
 use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
-use capture::{Action, Capture, DmabufInfo, Input, SLOTS};
+use capture::{Action, Capture, DmabufInfo, Held, HeldFrame, Input, SLOTS, Teardown};
 use chrome::{Chrome, Font};
 use clients::{Change, Clients};
 use config::Config;
@@ -71,10 +76,10 @@ use geometry::{Point, Rect, Size, thumbnail_size};
 use input::{Cursor, Effect, GRIP_SIZE, Gestures, PointerInput};
 use ipc::EventSocket;
 use layout::{Entry, KeyChange, LayoutFile, SaveAction, SaveSchedule};
-use overlay::Overlay;
+use overlay::{Overlay, alpha_factor};
 use protocol::hyprland_toplevel_export_frame_v1::{self, Flags, HyprlandToplevelExportFrameV1};
 use protocol::hyprland_toplevel_export_manager_v1::HyprlandToplevelExportManagerV1;
-use report::{DamageMode, Line, Reporter};
+use report::{DamageMode, Line, Reporter, Source};
 
 const RETRY_AFTER: Duration = Duration::from_millis(100);
 
@@ -213,7 +218,7 @@ enum Origin {
 }
 
 struct ClientState {
-    capture: Capture,
+    capture: Option<Capture>,
     overlay: Option<Overlay>,
     buffers: [Option<DmaBuffer>; SLOTS],
     frame: Option<Frame>,
@@ -263,11 +268,14 @@ struct App {
     dmabuf_state: DmabufState,
     viewporter: WpViewporter,
     export_manager: HyprlandToplevelExportManagerV1,
+    alpha: WpAlphaModifierV1,
     feedback: Feedback,
     allocator: Allocator,
     pointers: Vec<SeatPointer>,
     gestures: Gestures,
     press: Option<PressStart>,
+    hidden: bool,
+    hovered: Option<u64>,
     clients: Clients,
     records: BTreeMap<u64, ClientState>,
     imports: Imports<ZwpLinuxBufferParamsV1, PendingImport>,
@@ -287,7 +295,27 @@ struct App {
     requests: PathBuf,
     events: EventSocket,
     event_token: Option<RegistrationToken>,
+    control: Option<control::Server>,
+    control_loop: ControlLoop,
+    tray: Option<tray::Tray>,
+    tray_token: Option<RegistrationToken>,
+    ping: Option<Ping>,
+    ping_token: Option<RegistrationToken>,
     stop: Option<Stop>,
+}
+
+/// The loop registrations of the control socket. `App::control` holds the server itself, which
+/// is `None` only after shutdown has removed it.
+#[derive(Default)]
+struct ControlLoop {
+    listener: Option<RegistrationToken>,
+    pause: Option<RegistrationToken>,
+    connections: HashMap<control::ConnectionId, ConnectionTokens>,
+}
+
+struct ConnectionTokens {
+    source: RegistrationToken,
+    timer: Option<RegistrationToken>,
 }
 
 impl App {
@@ -333,10 +361,14 @@ impl App {
         if self.stop.is_some() {
             return;
         }
-        let Some(record) = self.records.get_mut(&address) else {
+        let Some(capture) = self
+            .records
+            .get_mut(&address)
+            .and_then(|r| r.capture.as_mut())
+        else {
             return;
         };
-        let actions = record.capture.handle(input, Instant::now());
+        let actions = capture.handle(input, Instant::now());
         self.execute(address, actions);
     }
 
@@ -448,6 +480,7 @@ impl App {
         };
         let size = thumbnail_size(width, buffer_size);
         let position = self.position_for(address, size);
+        let factor = alpha_factor(self.effective_opacity(address));
         let globals = overlay::Globals {
             compositor: &self.compositor,
             subcompositor: &self.subcompositor,
@@ -455,8 +488,9 @@ impl App {
             viewporter: &self.viewporter,
             shm: &self.shm,
             output: &output,
+            alpha: &self.alpha,
         };
-        match Overlay::new(&self.qh, &globals, position, size) {
+        match Overlay::new(&self.qh, &globals, position, size, factor) {
             Ok(overlay) => {
                 if let Some(record) = self.records.get_mut(&address) {
                     record.overlay = Some(overlay);
@@ -468,6 +502,27 @@ impl App {
             }
             Err(e) => self.stop(failure(e)),
         }
+    }
+
+    fn base_opacity(&self) -> u32 {
+        base_opacity(self.layout.opacity, self.config.thumbnail.opacity)
+    }
+
+    fn toggles(&self) -> control::Toggles {
+        control::Toggles {
+            locked: self.layout.locked,
+            hidden: self.hidden,
+            snapping: self.layout.snapping,
+            opacity: self.base_opacity(),
+        }
+    }
+
+    fn effective_opacity(&self, address: u64) -> u32 {
+        effective_opacity(self.base_opacity(), self.hovered == Some(address))
+    }
+
+    fn snap_distance(&self) -> u32 {
+        snap_distance(self.layout.snapping, self.config.thumbnail.snap_distance)
     }
 
     fn allocate(&mut self, address: u64, slot: usize, fourcc: u32, size: Size) -> Result<(), Stop> {
@@ -543,6 +598,7 @@ impl App {
         let ring = (self.clients.ring_owner() == Some(address) && border.width > 0)
             .then_some((border.width, border.color));
         let buffer = chrome::buffer_size(logical, self.scale);
+        let opacity = self.effective_opacity(address);
         let Some(record) = self.records.get_mut(&address) else {
             return true;
         };
@@ -554,6 +610,7 @@ impl App {
             label: &label,
             style: &self.config.label,
             scale: self.scale,
+            opacity,
         };
         let font = &self.font;
         let result = overlay.draw_chrome(logical, buffer, |canvas, size| {
@@ -769,10 +826,11 @@ impl App {
             ),
         };
         let handle = hypr::capture_handle(address);
+        let capture = (!self.hidden).then(|| Capture::new(self.mode, address, handle));
         self.records.insert(
             address,
             ClientState {
-                capture: Capture::new(self.mode, address, handle),
+                capture,
                 overlay: None,
                 buffers: Default::default(),
                 frame: None,
@@ -796,26 +854,155 @@ impl App {
             if self.press.is_some_and(|p| p.address == address) {
                 self.press = None;
             }
-            if let Some(token) = record.timer.take() {
-                self.loop_handle.remove(token);
+            if self.hovered == Some(address) {
+                self.hovered = None;
             }
-            if let Some(frame) = record.frame.take() {
-                if frame.got_event {
-                    frame.proxy.destroy();
-                } else {
-                    self.orphans.push(frame);
-                }
-            }
-            if let Some(overlay) = record.overlay.take() {
-                overlay.destroy();
-            }
-            for buffer in record.buffers.iter_mut().filter_map(Option::take) {
-                buffer.destroy();
-            }
-            self.imports.release_owner(address);
+            self.tear_down(address, &mut record);
         }
         self.emit(&Line::ClientRemoved { address, reason });
         self.recompute_placement();
+    }
+
+    /// Releases everything the record holds, in the order `capture::teardown` plans.
+    fn tear_down(&mut self, address: u64, record: &mut ClientState) {
+        let held = Held {
+            timer: record.timer.is_some(),
+            frame: match &record.frame {
+                None => HeldFrame::None,
+                Some(frame) if frame.got_event => HeldFrame::Answered,
+                Some(_) => HeldFrame::Unanswered,
+            },
+            overlay: record.overlay.is_some(),
+            buffers: std::array::from_fn(|slot| record.buffers[slot].is_some()),
+        };
+        for step in capture::teardown(held) {
+            match step {
+                Teardown::CancelTimer => {
+                    if let Some(token) = record.timer.take() {
+                        self.loop_handle.remove(token);
+                    }
+                }
+                Teardown::DestroyFrame => {
+                    if let Some(frame) = record.frame.take() {
+                        frame.proxy.destroy();
+                    }
+                }
+                Teardown::OrphanFrame => {
+                    if let Some(frame) = record.frame.take() {
+                        self.orphans.push(frame);
+                    }
+                }
+                Teardown::DestroyOverlay => {
+                    if let Some(overlay) = record.overlay.take() {
+                        overlay.destroy();
+                    }
+                }
+                Teardown::DestroyBuffer { slot } => {
+                    if let Some(buffer) = record.buffers[slot].take() {
+                        buffer.destroy();
+                    }
+                }
+                Teardown::ReleaseImports => self.imports.release_owner(address),
+            }
+        }
+    }
+
+    fn hide(&mut self) {
+        self.end_pointer_interaction();
+        let addresses: Vec<u64> = self.records.keys().copied().collect();
+        for address in addresses {
+            let Some(mut record) = self.records.remove(&address) else {
+                continue;
+            };
+            self.tear_down(address, &mut record);
+            record.capture = None;
+            record.buffer_size = None;
+            record.chromed = false;
+            self.records.insert(address, record);
+        }
+        self.hidden = true;
+    }
+
+    fn show(&mut self) {
+        self.hidden = false;
+        let addresses: Vec<u64> = self.records.keys().copied().collect();
+        for address in addresses {
+            let handle = hypr::capture_handle(address);
+            if let Some(record) = self.records.get_mut(&address) {
+                record.capture = Some(Capture::new(self.mode, address, handle));
+            }
+            self.feed(address, Input::Start);
+        }
+    }
+
+    /// Applies a lock, snap, visibility or opacity command. Returns what `Tray::set_state`
+    /// returned: `Some` only when the state changed and a tray is up. It never drains the tray.
+    fn apply_command(
+        &mut self,
+        command: control::Command,
+        source: Source,
+    ) -> Option<Result<tray::Pass, String>> {
+        let before = self.toggles();
+        let after = control::apply(before, command, self.stop.is_some());
+        if after == before {
+            return None;
+        }
+        if after.locked != before.locked {
+            self.layout.locked = after.locked;
+            self.gestures.set_locked(after.locked);
+            self.emit(&Line::Lock {
+                locked: after.locked,
+                source,
+            });
+            self.request_save();
+        }
+        if after.snapping != before.snapping {
+            self.layout.snapping = after.snapping;
+            self.emit(&Line::Snap {
+                snapping: after.snapping,
+                source,
+            });
+            self.request_save();
+        }
+        if after.hidden != before.hidden {
+            if after.hidden {
+                self.hide();
+            } else {
+                self.show();
+            }
+            self.emit(&Line::Visibility {
+                hidden: after.hidden,
+                source,
+            });
+        }
+        if after.opacity != before.opacity {
+            self.layout.opacity = Some(after.opacity);
+            let addresses: Vec<u64> = self
+                .records
+                .iter()
+                .filter(|(address, record)| {
+                    record.overlay.is_some() && self.hovered != Some(**address)
+                })
+                .map(|(address, _)| *address)
+                .collect();
+            for address in addresses {
+                let factor = alpha_factor(self.effective_opacity(address));
+                if let Some(overlay) = self
+                    .records
+                    .get_mut(&address)
+                    .and_then(|r| r.overlay.as_mut())
+                {
+                    overlay.set_alpha(factor);
+                }
+                self.rerender_chrome(address);
+            }
+            self.emit(&Line::Opacity {
+                percent: after.opacity,
+                source,
+            });
+            self.request_save();
+        }
+        self.tray.as_mut().map(|tray| tray.set_state(after))
     }
 
     fn title_changed(&mut self, address: u64, label_changed: bool, key_changed: bool) {
@@ -1091,9 +1278,69 @@ impl App {
         let Some(start) = self.press.filter(|p| p.address == address) else {
             return;
         };
-        let x = i64::from(start.position.x) + offset.0.round() as i64;
-        let y = i64::from(start.position.y) + offset.1.round() as i64;
-        self.move_clamped(address, x, y);
+        let Some(size) = self
+            .records
+            .get(&address)
+            .and_then(|r| r.overlay.as_ref())
+            .map(Overlay::size)
+        else {
+            return;
+        };
+        let others: Vec<Rect> = self
+            .records
+            .iter()
+            .filter(|(other, _)| **other != address)
+            .filter_map(|(_, r)| {
+                r.overlay.as_ref().map(|o| Rect {
+                    x: r.position.x,
+                    y: r.position.y,
+                    width: o.size().width,
+                    height: o.size().height,
+                })
+            })
+            .collect();
+        let position = drag_position(
+            start.position,
+            offset,
+            size,
+            &others,
+            self.usable,
+            self.snap_distance(),
+        );
+        self.move_clamped(address, i64::from(position.x), i64::from(position.y));
+    }
+
+    /// A missing leave, for example a pointer capability loss, would leave a stale 100 %.
+    fn set_hovered(&mut self, next: Option<u64>) {
+        if self.stop.is_some() {
+            return;
+        }
+        let previous = self.hovered;
+        if previous == next {
+            return;
+        }
+        self.hovered = next;
+        if let Some(address) = previous {
+            self.hover_changed(address, true, false);
+        }
+        if let Some(address) = next {
+            self.hover_changed(address, false, true);
+        }
+    }
+
+    fn hover_changed(&mut self, address: u64, before: bool, after: bool) {
+        let Some(percent) = opacity_change(self.base_opacity(), before, after) else {
+            return;
+        };
+        let Some(overlay) = self
+            .records
+            .get_mut(&address)
+            .and_then(|r| r.overlay.as_mut())
+        else {
+            return;
+        };
+        overlay.set_alpha(alpha_factor(percent));
+        self.rerender_chrome(address);
     }
 
     fn begin_press(&mut self, address: u64) {
@@ -1113,13 +1360,18 @@ impl App {
             .is_some_and(|o| in_grip(position, o.size()))
     }
 
-    fn drop_pointers(&mut self, seat: &WlSeat) {
+    fn end_pointer_interaction(&mut self) {
         if let Some(address) = self.gestures.active()
             && self.stop.is_none()
         {
             self.route_input(None, PointerInput::Leave { address });
         }
         self.press = None;
+        self.set_hovered(None);
+    }
+
+    fn drop_pointers(&mut self, seat: &WlSeat) {
+        self.end_pointer_interaction();
         for pointer in std::mem::take(&mut self.pointers) {
             if pointer.seat == *seat {
                 pointer.relative.destroy();
@@ -1233,9 +1485,390 @@ impl App {
         Ok(())
     }
 
-    /// Tears down timers, the pending layout save and Wayland objects, prints `exit` and exits.
+    fn control_error(&mut self, error: impl Into<String>) {
+        self.emit(&Line::ControlError {
+            error: error.into(),
+        });
+    }
+
+    fn control_reply_error(&mut self, result: Result<(), control::ReplyError>) {
+        if let Err(e) = result {
+            self.control_error(format!("reply: {e}"));
+        }
+    }
+
+    fn control_shutdown_error(&mut self, result: std::io::Result<()>) {
+        if let Err(e) = result {
+            self.control_error(format!("shutdown: {e}"));
+        }
+    }
+
+    fn insert_control_source(&mut self) -> Result<(), SetupError> {
+        let Some(server) = self.control.as_ref() else {
+            return Ok(());
+        };
+        let fd = server.listener_fd().map_err(loop_error)?;
+        let source = Generic::new(fd, Interest::READ, Mode::Level);
+        let token = self
+            .loop_handle
+            .insert_source(source, |_, _, app: &mut App| Ok(app.accept_connections()))
+            .map_err(loop_error)?;
+        self.control_loop.listener = Some(token);
+        Ok(())
+    }
+
+    fn announce_control(&mut self) {
+        let Some(path) = self.control.as_ref().map(|s| s.path().to_path_buf()) else {
+            return;
+        };
+        self.emit(&Line::ControlListening { path });
+    }
+
+    fn accept_connections(&mut self) -> PostAction {
+        if self.stop.is_some() {
+            return PostAction::Continue;
+        }
+        let Some(server) = self.control.as_mut() else {
+            return PostAction::Continue;
+        };
+        let (admissions, error) = server.accept();
+        for admission in admissions {
+            match admission {
+                control::Admission::Open(accepted) => self.watch_connection(accepted),
+                control::Admission::Busy(result) => {
+                    self.control_error(control::Refusal::Busy.to_string());
+                    self.control_reply_error(result);
+                }
+            }
+        }
+        let Some(error) = error else {
+            return PostAction::Continue;
+        };
+        self.control_error(format!("accept: {error}"));
+        self.pause_accepting()
+    }
+
+    fn pause_accepting(&mut self) -> PostAction {
+        let timer = Timer::from_duration(control::ACCEPT_PAUSE);
+        match self
+            .loop_handle
+            .insert_source(timer, |_, _, app: &mut App| {
+                app.control_loop.pause = None;
+                app.resume_accepting();
+                TimeoutAction::Drop
+            }) {
+            Ok(token) => {
+                self.control_loop.pause = Some(token);
+                PostAction::Disable
+            }
+            Err(e) => {
+                self.stop(failure(loop_error(e)));
+                PostAction::Continue
+            }
+        }
+    }
+
+    fn resume_accepting(&mut self) {
+        let Some(token) = self.control_loop.listener else {
+            return;
+        };
+        if let Err(e) = self.loop_handle.enable(&token) {
+            self.stop(failure(loop_error(e)));
+        }
+    }
+
+    fn watch_connection(&mut self, accepted: control::Accepted) {
+        let control::Accepted { id, fd, deadline } = accepted;
+        let source = Generic::new(fd, Interest::READ, Mode::Level);
+        let source = match self
+            .loop_handle
+            .insert_source(source, move |_, _, app: &mut App| {
+                Ok(app.connection_readable(id))
+            }) {
+            Ok(token) => token,
+            Err(e) => {
+                self.control_error(format!("accept: {e}"));
+                self.close_connection(id);
+                return;
+            }
+        };
+        self.control_loop.connections.insert(
+            id,
+            ConnectionTokens {
+                source,
+                timer: None,
+            },
+        );
+        let timer = Timer::from_deadline(deadline);
+        match self
+            .loop_handle
+            .insert_source(timer, move |_, _, app: &mut App| {
+                app.connection_deadline(id);
+                TimeoutAction::Drop
+            }) {
+            Ok(token) => {
+                if let Some(tokens) = self.control_loop.connections.get_mut(&id) {
+                    tokens.timer = Some(token);
+                }
+            }
+            Err(e) => {
+                self.control_error(format!("accept: {e}"));
+                self.forget_connection(id);
+                self.close_connection(id);
+            }
+        }
+    }
+
+    fn close_connection(&mut self, id: control::ConnectionId) {
+        let result = match self.control.as_mut() {
+            Some(server) => server.close(id),
+            None => Ok(()),
+        };
+        self.control_shutdown_error(result);
+    }
+
+    fn reply_connection(
+        &mut self,
+        id: control::ConnectionId,
+        result: Result<(), control::Refusal>,
+    ) {
+        let result = match self.control.as_mut() {
+            Some(server) => server.reply(id, result),
+            None => Ok(()),
+        };
+        self.control_reply_error(result);
+    }
+
+    fn forget_connection(&mut self, id: control::ConnectionId) {
+        if let Some(tokens) = self.control_loop.connections.remove(&id) {
+            self.loop_handle.remove(tokens.source);
+            if let Some(timer) = tokens.timer {
+                self.loop_handle.remove(timer);
+            }
+        }
+    }
+
+    fn connection_readable(&mut self, id: control::ConnectionId) -> PostAction {
+        let Some(server) = self.control.as_mut() else {
+            return PostAction::Continue;
+        };
+        let stopping = self.stop.is_some();
+        match server.read(id) {
+            control::ReadOutcome::Pending => return PostAction::Continue,
+            control::ReadOutcome::Line(_) if stopping => self.close_connection(id),
+            control::ReadOutcome::Line(Ok(command)) => {
+                let pass = self.apply_command(command, Source::Socket);
+                self.reply_connection(id, Ok(()));
+                if let Some(first) = pass {
+                    self.drain_loop(first, false);
+                }
+            }
+            control::ReadOutcome::Line(Err(refusal)) => {
+                self.control_error(refusal.to_string());
+                self.reply_connection(id, Err(refusal));
+            }
+            control::ReadOutcome::Closed(result) => self.control_shutdown_error(result),
+            control::ReadOutcome::Failed { read, shutdown } => {
+                self.control_error(format!("read: {read}"));
+                self.control_shutdown_error(shutdown);
+            }
+        }
+        self.forget_connection(id);
+        PostAction::Continue
+    }
+
+    fn connection_deadline(&mut self, id: control::ConnectionId) {
+        if self.stop.is_some() {
+            return;
+        }
+        if let Some(tokens) = self.control_loop.connections.get_mut(&id) {
+            tokens.timer = None;
+        }
+        let timed_out = self.control.as_mut().and_then(|server| server.timeout(id));
+        if let Some(result) = timed_out {
+            self.control_error(control::Refusal::Timeout.to_string());
+            self.control_reply_error(result);
+        }
+        self.forget_connection(id);
+    }
+
+    fn start_tray(&mut self) {
+        let toggles = self.toggles();
+        match tray::Tray::start(std::process::id(), toggles, self.config.border.color) {
+            Err(reason) => self.emit(&Line::TrayUnavailable { reason }),
+            Ok((tray, registered)) => {
+                let line = match registered {
+                    Ok(()) => Line::TrayRegistered {
+                        name: tray.name().to_string(),
+                    },
+                    Err(reason) => Line::TrayUnavailable { reason },
+                };
+                self.tray = Some(tray);
+                self.emit(&line);
+            }
+        }
+    }
+
+    /// Inserts the tray source and the drain ping source. A failure ends the tray.
+    fn watch_tray(&mut self) {
+        let Some(source) = self.tray.as_ref().map(tray::Tray::source) else {
+            return;
+        };
+        if let Err(e) = self.insert_tray_sources(source) {
+            self.end_tray(format!("watch: {e}"), false);
+        }
+    }
+
+    fn insert_tray_sources(
+        &mut self,
+        source: Result<tray::TraySource, String>,
+    ) -> Result<(), String> {
+        let source = Generic::new(source?, Interest::READ, Mode::Level);
+        let token = self
+            .loop_handle
+            .insert_source(source, |_, _, app: &mut App| Ok(app.tray_readable()))
+            .map_err(|e| e.to_string())?;
+        self.tray_token = Some(token);
+        let (ping, source) = make_ping().map_err(|e| e.to_string())?;
+        let token = self
+            .loop_handle
+            .insert_source(source, |_, _, app: &mut App| app.drain_tray(false))
+            .map_err(|e| e.to_string())?;
+        self.ping_token = Some(token);
+        self.ping = Some(ping);
+        Ok(())
+    }
+
+    fn tray_readable(&mut self) -> PostAction {
+        self.drain_tray(true);
+        if self.tray.is_some() {
+            PostAction::Continue
+        } else {
+            PostAction::Remove
+        }
+    }
+
+    /// Runs the drain loop from a fresh `Tray::drain` pass. Does nothing without a tray.
+    fn drain_tray(&mut self, in_tray_callback: bool) {
+        if let Some(first) = self.tray.as_mut().map(tray::Tray::drain) {
+            self.drain_loop(first, in_tray_callback);
+        }
+    }
+
+    /// Applies the tray's passes in order, at most `MAX_DRAIN_PASSES` per call. An `Err` pass is
+    /// the bus error.
+    fn drain_loop(&mut self, first: Result<tray::Pass, String>, in_tray_callback: bool) {
+        let mut next = first;
+        for number in 1..=tray::MAX_DRAIN_PASSES {
+            let tray::Pass { events, more } = match next {
+                Ok(pass) => pass,
+                Err(reason) => {
+                    self.end_tray(reason, in_tray_callback);
+                    return;
+                }
+            };
+            let bound = number == tray::MAX_DRAIN_PASSES;
+            let mut set_state = None;
+            let mut command = false;
+            for event in events {
+                match event {
+                    tray::TrayEvent::Registered => {
+                        if let Some(name) = self.tray.as_ref().map(|t| t.name().to_string()) {
+                            self.emit(&Line::TrayRegistered { name });
+                        }
+                    }
+                    tray::TrayEvent::Unavailable(reason) => {
+                        self.emit(&Line::TrayUnavailable { reason });
+                    }
+                    tray::TrayEvent::Command(menu) => {
+                        command = true;
+                        if bound {
+                            if let Some(tray) = self.tray.as_mut() {
+                                tray.defer(menu);
+                            }
+                        } else {
+                            match menu {
+                                tray::MenuCommand::Quit => {
+                                    self.stop_with(0, "tray quit");
+                                    return;
+                                }
+                                tray::MenuCommand::Toggle(toggle) => {
+                                    set_state = self.apply_command(toggle, Source::Tray);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if bound {
+                if command || more {
+                    self.emit(&Line::TrayUnavailable {
+                        reason: format!("drain: {} passes", tray::MAX_DRAIN_PASSES),
+                    });
+                    if let Some(ping) = &self.ping {
+                        ping.ping();
+                    }
+                }
+                return;
+            }
+            next = match set_state {
+                Some(pass) => pass,
+                None if more => match self.tray.as_mut() {
+                    Some(tray) => tray.drain(),
+                    None => return,
+                },
+                None => return,
+            };
+        }
+    }
+
+    /// Reports the tray as unavailable and ends it: its sources leave the loop and an idle
+    /// callback drops it, after every source callback of this dispatch has returned.
+    fn end_tray(&mut self, reason: String, in_tray_callback: bool) {
+        self.emit(&Line::TrayUnavailable { reason });
+        if let Some(token) = self.tray_token.take()
+            && !in_tray_callback
+        {
+            self.loop_handle.remove(token);
+        }
+        if let Some(token) = self.ping_token.take() {
+            self.loop_handle.remove(token);
+        }
+        self.ping = None;
+        if let Some(tray) = self.tray.take() {
+            self.loop_handle.insert_idle(move |_: &mut App| drop(tray));
+        }
+    }
+
+    /// Removes the control sources and the socket, then drops the tray and the ping, and tears
+    /// down timers, the pending layout save and Wayland objects. Prints `exit` and exits.
     /// Callers keep the `Signals` source installed until exit, so a late signal stays pending.
     fn shutdown(mut self, stop: Stop) -> ! {
+        let mut teardown = Vec::new();
+        for token in [
+            self.control_loop.listener.take(),
+            self.control_loop.pause.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.loop_handle.remove(token);
+        }
+        let ids: Vec<_> = self.control_loop.connections.keys().copied().collect();
+        for id in ids {
+            self.forget_connection(id);
+        }
+        if let Some(server) = self.control.take() {
+            teardown.extend(remove_control(server));
+        }
+        for token in [self.tray_token.take(), self.ping_token.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.loop_handle.remove(token);
+        }
+        self.ping = None;
+        drop(self.tray.take());
         for record in self.records.values_mut() {
             if let Some(token) = record.timer.take() {
                 self.loop_handle.remove(token);
@@ -1275,7 +1908,9 @@ impl App {
             drop(pointer.themed);
         }
         self.export_manager.destroy();
-        let error = self.conn.flush().err().map(|e| format!("flush: {e}"));
+        self.alpha.destroy();
+        teardown.extend(self.conn.flush().err().map(|e| format!("flush: {e}")));
+        let error = (!teardown.is_empty()).then(|| teardown.join("; "));
         drop(objects);
         drop(pending);
         drop(self.allocator);
@@ -1543,8 +2178,14 @@ impl PointerHandler for App {
                 continue;
             };
             let input = match &event.kind {
-                PointerEventKind::Enter { .. } => PointerInput::Enter { address },
-                PointerEventKind::Leave { .. } => PointerInput::Leave { address },
+                PointerEventKind::Enter { .. } => {
+                    self.set_hovered(Some(address));
+                    PointerInput::Enter { address }
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.set_hovered(None);
+                    PointerInput::Leave { address }
+                }
                 PointerEventKind::Motion { .. } => PointerInput::Motion {
                     address,
                     in_grip: self.in_grip_at(address, event.position),
@@ -1657,6 +2298,10 @@ wayland_client::delegate_noop!(App: ignore WpViewporter);
 
 wayland_client::delegate_noop!(App: ignore WpViewport);
 
+wayland_client::delegate_noop!(App: ignore WpAlphaModifierV1);
+
+wayland_client::delegate_noop!(App: ignore WpAlphaModifierSurfaceV1);
+
 impl Dispatch<WlCallback, (u64, u64)> for App {
     fn event(
         state: &mut App,
@@ -1688,6 +2333,47 @@ impl Dispatch<WlCallback, (u64, u64)> for App {
 /// answers with a missing-frame outcome only.
 fn eventless_sync(sync_id: u64, got_event: bool, id: u64) -> bool {
     sync_id == id && !got_event
+}
+
+/// The base opacity in percent: the layout file's value when it has one, else the config's.
+fn base_opacity(layout: Option<u32>, config: u32) -> u32 {
+    layout.unwrap_or(config)
+}
+
+/// The drag snap distance: `configured` while snapping is on, else 0, which never snaps.
+fn snap_distance(snapping: bool, configured: u32) -> u32 {
+    if snapping { configured } else { 0 }
+}
+
+/// The opacity a thumbnail shows: `config::MAX_OPACITY` while hovered, otherwise `base`, from
+/// `base_opacity`.
+fn effective_opacity(base: u32, hovered: bool) -> u32 {
+    if hovered { config::MAX_OPACITY } else { base }
+}
+
+/// The new effective opacity in percent, only when a hover change alters it.
+fn opacity_change(base: u32, hovered_before: bool, hovered_after: bool) -> Option<u32> {
+    let before = effective_opacity(base, hovered_before);
+    let after = effective_opacity(base, hovered_after);
+    (before != after).then_some(after)
+}
+
+/// The position a drag gives a thumbnail: the press position plus the rounded offset, snapped to
+/// the usable edges and the other thumbnails, then clamped.
+fn drag_position(
+    start: Point,
+    offset: (f64, f64),
+    size: Size,
+    others: &[Rect],
+    usable: Size,
+    distance: u32,
+) -> Point {
+    let origin = (
+        i64::from(start.x) + offset.0.round() as i64,
+        i64::from(start.y) + offset.1.round() as i64,
+    );
+    let (x, y) = layout::snap(origin, size, others, usable, distance);
+    layout::clamp_position(x, y, size, usable)
 }
 
 /// Whether a client sits at its default-row slot. The client of an active gesture keeps the
@@ -1776,15 +2462,31 @@ fn finish(reporter: &mut Reporter, stop: Stop, teardown: Option<String>) -> ! {
     std::process::exit(i32::from(code))
 }
 
-fn fail(reporter: &mut Reporter, code: u8, reason: impl std::fmt::Display) -> ! {
+/// Exits with `code` after the `exit` line. `teardown` is the text of a failed cleanup.
+fn fail(
+    reporter: &mut Reporter,
+    code: u8,
+    reason: impl std::fmt::Display,
+    teardown: Option<String>,
+) -> ! {
     finish(
         reporter,
         Stop::Exit {
             code,
             reason: reason.to_string(),
         },
-        None,
+        teardown,
     )
+}
+
+/// Removes the control socket file and the connections. The error is a `teardown` text for
+/// `finish`.
+fn remove_control(server: control::Server) -> Option<String> {
+    let path = server.path().to_path_buf();
+    server
+        .remove()
+        .err()
+        .map(|e| format!("control socket {}: remove: {e}", path.display()))
 }
 
 fn emit_or_finish(reporter: &mut Reporter, line: &Line) {
@@ -1842,6 +2544,7 @@ struct Parts {
     layer_shell: LayerShell,
     viewporter: WpViewporter,
     export_manager: HyprlandToplevelExportManagerV1,
+    alpha: WpAlphaModifierV1,
     seat_state: SeatState,
     relative_pointer_state: RelativePointerState,
 }
@@ -1868,6 +2571,9 @@ fn bind_wayland() -> Result<Parts, SetupError> {
     let export_manager = globals
         .bind::<HyprlandToplevelExportManagerV1, _, _>(&qh, 1..=2, ())
         .map_err(global("hyprland_toplevel_export_manager_v1"))?;
+    let alpha = globals
+        .bind::<WpAlphaModifierV1, _, _>(&qh, 1..=1, ())
+        .map_err(global("wp_alpha_modifier_v1"))?;
     let advertised = globals.contents().with_list(|list| {
         list.iter()
             .any(|g| g.interface == "zwp_relative_pointer_manager_v1")
@@ -1892,6 +2598,7 @@ fn bind_wayland() -> Result<Parts, SetupError> {
         layer_shell,
         viewporter,
         export_manager,
+        alpha,
         seat_state,
         relative_pointer_state,
     })
@@ -1905,6 +2612,7 @@ struct Startup {
     layout: LayoutFile,
     requests: PathBuf,
     events: EventSocket,
+    control: control::Server,
     clients: Clients,
     scale: f64,
     usable: Rect,
@@ -1922,6 +2630,7 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         layout,
         requests,
         events,
+        control,
         clients,
         scale,
         usable,
@@ -1929,7 +2638,7 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
     } = startup;
     let parts = match bind_wayland() {
         Ok(parts) => parts,
-        Err(e) => fail(&mut reporter, 1, e),
+        Err(e) => fail(&mut reporter, 1, e, remove_control(control)),
     };
     let Parts {
         conn,
@@ -1943,10 +2652,13 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         layer_shell,
         viewporter,
         export_manager,
+        alpha,
         seat_state,
         relative_pointer_state,
     } = parts;
     let qh = queue.handle();
+    let mut gestures = Gestures::default();
+    gestures.set_locked(layout.locked);
     let mut app = App {
         conn: conn.clone(),
         qh: qh.clone(),
@@ -1962,11 +2674,14 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         dmabuf_state: DmabufState::new(&globals, &qh),
         viewporter,
         export_manager,
+        alpha,
         feedback,
         allocator,
         pointers: Vec::new(),
-        gestures: Gestures::default(),
+        gestures,
         press: None,
+        hidden: false,
+        hovered: None,
         clients,
         records: BTreeMap::new(),
         imports: Imports::new(),
@@ -1989,6 +2704,12 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         requests,
         events,
         event_token: None,
+        control: Some(control),
+        control_loop: ControlLoop::default(),
+        tray: None,
+        tray_token: None,
+        ping: None,
+        ping_token: None,
         stop: None,
     };
     // The wl_output binds from OutputState::new are answered up to `done` before the sync returns.
@@ -2013,7 +2734,43 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
     app
 }
 
-/// Runs startup from the log file to the `start` line. A failure prints the `exit` line and exits.
+struct HyprState {
+    usable: Rect,
+    scale: f64,
+    snapshot: Vec<hypr::Client>,
+    active: Option<u64>,
+}
+
+/// Reads the monitor, the client list and the active window. The error is the `exit` reason.
+fn read_hyprland(requests: &Path, output: &str) -> Result<HyprState, String> {
+    let monitors = query(requests, "j/monitors", hypr::parse_monitors)?;
+    let Some(monitor) = monitors.iter().find(|m| m.name == output) else {
+        return Err(format!("no monitor named {output} in j/monitors"));
+    };
+    let usable = monitor.usable_area();
+    let scale = monitor.scale;
+    let snapshot = query(requests, "j/clients", hypr::parse_clients)?;
+    let active = query(requests, "j/activewindow", hypr::parse_active_window)?;
+    Ok(HyprState {
+        usable,
+        scale,
+        snapshot,
+        active,
+    })
+}
+
+/// Resolves the Hyprland sockets from the environment or exits with code 1.
+fn sockets_from_env(reporter: &mut Reporter) -> ipc::Sockets {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    match ipc::sockets(runtime_dir.as_deref(), signature.as_deref()) {
+        Ok(sockets) => sockets,
+        Err(e) => fail(reporter, 1, e, None),
+    }
+}
+
+/// Runs startup from the config to the `start` line. A failure prints the `exit` line and exits,
+/// or exits 1 when stderr fails.
 fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Client>) {
     let home = std::env::var_os("HOME");
     let config_path = match &args.config {
@@ -2026,6 +2783,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
                     &mut reporter,
                     1,
                     "no config path: XDG_CONFIG_HOME and HOME are unset or unusable",
+                    None,
                 ),
             }
         }
@@ -2036,6 +2794,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
             &mut reporter,
             2,
             format!("config {}: {e}", config_path.display()),
+            None,
         ),
     };
     let (font, font_path) = match &config.label.font_file {
@@ -2045,6 +2804,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
                 &mut reporter,
                 2,
                 format!("label.font_file {}: {e}", path.display()),
+                None,
             ),
         },
         None => {
@@ -2053,7 +2813,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
                 .and_then(|path| Font::load(&path).map(|font| (font, path)));
             match loaded {
                 Ok(loaded) => loaded,
-                Err(e) => fail(&mut reporter, 1, format!("fc-match {family}: {e}")),
+                Err(e) => fail(&mut reporter, 1, format!("fc-match {family}: {e}"), None),
             }
         }
     };
@@ -2063,6 +2823,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
             &mut reporter,
             1,
             "no layout path: XDG_STATE_HOME and HOME are unset or unusable",
+            None,
         )
     };
     let layout = match layout::load(&layout_path) {
@@ -2081,43 +2842,27 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
                 &mut reporter,
                 1,
                 format!("layout {}: {e}; rename: {rename}", layout_path.display()),
+                None,
             ),
         },
     };
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-    let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
-    let sockets = match ipc::sockets(runtime_dir.as_deref(), signature.as_deref()) {
-        Ok(sockets) => sockets,
-        Err(e) => fail(&mut reporter, 1, e),
-    };
+    let sockets = sockets_from_env(&mut reporter);
     let events = match EventSocket::connect(&sockets.events) {
         Ok(events) => events,
-        Err(e) => fail(&mut reporter, 1, format!("event socket: {e}")),
+        Err(e) => fail(&mut reporter, 1, format!("event socket: {e}"), None),
     };
-    let monitors = match query(&sockets.requests, "j/monitors", hypr::parse_monitors) {
-        Ok(monitors) => monitors,
-        Err(reason) => fail(&mut reporter, 1, reason),
+    let control = match control::Server::bind(&sockets.control) {
+        Ok(server) => server,
+        Err(e) => fail(&mut reporter, 1, e, None),
     };
-    let Some(monitor) = monitors.iter().find(|m| m.name == config.output) else {
-        fail(
-            &mut reporter,
-            1,
-            format!("no monitor named {} in j/monitors", config.output),
-        )
-    };
-    let usable = monitor.usable_area();
-    let scale = monitor.scale;
-    let snapshot = match query(&sockets.requests, "j/clients", hypr::parse_clients) {
-        Ok(snapshot) => snapshot,
-        Err(reason) => fail(&mut reporter, 1, reason),
-    };
-    let active = match query(
-        &sockets.requests,
-        "j/activewindow",
-        hypr::parse_active_window,
-    ) {
-        Ok(active) => active,
-        Err(reason) => fail(&mut reporter, 1, reason),
+    let HyprState {
+        usable,
+        scale,
+        snapshot,
+        active,
+    } = match read_hyprland(&sockets.requests, &config.output) {
+        Ok(state) => state,
+        Err(reason) => fail(&mut reporter, 1, reason, remove_control(control)),
     };
     let mode = if args.ignore_damage {
         DamageMode::IgnoreDamage
@@ -2131,9 +2876,12 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
         mode,
         config: config_read,
         layout: layout_path.clone(),
+        locked: layout.locked,
         font: font_path,
     };
-    emit_or_finish(&mut reporter, &start);
+    if reporter.emit(&start).is_err() {
+        finish(&mut reporter, Stop::StderrFailed, remove_control(control));
+    }
     let startup = Startup {
         reporter,
         config,
@@ -2142,6 +2890,7 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
         layout,
         requests: sockets.requests,
         events,
+        control,
         clients: Clients::new(active),
         scale,
         usable,
@@ -2150,10 +2899,21 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
     (startup, snapshot)
 }
 
+/// Sends a command to the running daemon and exits. It opens no log, config or layout file.
+fn run_command(command: control::Command) -> ! {
+    let mut reporter = Reporter::stderr(false);
+    let sockets = sockets_from_env(&mut reporter);
+    match control::send(&sockets.control, command) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => fail(&mut reporter, 1, e, None),
+    }
+}
+
 fn main() -> ! {
     let start = Instant::now();
     let args = match cli::parse_os(std::env::args_os().skip(1)) {
-        Ok(args) => args,
+        Ok(cli::Invocation::Daemon(args)) => args,
+        Ok(cli::Invocation::Command(command)) => run_command(command),
         Err(e) => {
             let message = e.to_string();
             let mut reporter = Reporter::stderr(false);
@@ -2163,7 +2923,7 @@ fn main() -> ! {
                     message: message.clone(),
                 },
             );
-            fail(&mut reporter, 2, message)
+            fail(&mut reporter, 2, message, None)
         }
     };
     let reporter = match args.log.as_deref() {
@@ -2172,7 +2932,12 @@ fn main() -> ! {
             Ok(reporter) => reporter,
             Err(e) => {
                 let mut reporter = Reporter::stderr(args.verbose);
-                fail(&mut reporter, 1, format!("log {}: {e}", path.display()))
+                fail(
+                    &mut reporter,
+                    1,
+                    format!("log {}: {e}", path.display()),
+                    None,
+                )
             }
         },
     };
@@ -2180,7 +2945,12 @@ fn main() -> ! {
 
     let mut event_loop = match EventLoop::<App>::try_new() {
         Ok(l) => l,
-        Err(e) => fail(&mut startup.reporter, 1, loop_error(e)),
+        Err(e) => fail(
+            &mut startup.reporter,
+            1,
+            loop_error(e),
+            remove_control(startup.control),
+        ),
     };
     let mut app = setup(startup, event_loop.handle());
     let signals = match Signals::new(&[Signal::SIGINT, Signal::SIGTERM]) {
@@ -2199,6 +2969,7 @@ fn main() -> ! {
     if let Err(e) = inserted {
         app.shutdown(failure(loop_error(&e)));
     }
+    app.start_tray();
     for entry in &snapshot {
         if app.stop.is_some() {
             break;
@@ -2210,6 +2981,12 @@ fn main() -> ! {
     if let Err(e) = app.insert_event_source() {
         app.shutdown(failure(e));
     }
+    if let Err(e) = app.insert_control_source() {
+        app.shutdown(failure(e));
+    }
+    app.watch_tray();
+    app.drain_tray(false);
+    app.announce_control();
 
     let deadline = args.seconds.map(|s| start + Duration::from_secs(s));
     let stop = loop {
@@ -2464,6 +3241,17 @@ mod tests {
                 vec![],
             ),
             (
+                "hidden owner's imports in both slots resolve as superseded",
+                vec![
+                    Begin(1, 0, 1, "a"),
+                    Begin(1, 1, 2, "b"),
+                    Release(1),
+                    Event(1, Some(Superseded("a"))),
+                    Event(2, Some(Superseded("b"))),
+                ],
+                vec![],
+            ),
+            (
                 "released owner keeps every pending import",
                 vec![Begin(1, 0, 1, "a"), Begin(1, 1, 2, "b"), Release(1)],
                 vec![(1, "a"), (2, "b")],
@@ -2497,6 +3285,145 @@ mod tests {
             let mut left = imports.drain();
             left.sort_by_key(|(key, _)| *key);
             assert_eq!(left, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn drag_position_cases() {
+        let size = Size {
+            width: 480,
+            height: 264,
+        };
+        let usable = Size {
+            width: 2560,
+            height: 1406,
+        };
+        let odd = Size {
+            width: 2561,
+            height: 1406,
+        };
+        let neighbour = Rect {
+            x: 1000,
+            y: 400,
+            width: 320,
+            height: 176,
+        };
+        let left = Rect {
+            x: 100,
+            y: 400,
+            width: 320,
+            height: 176,
+        };
+        type Case<'a> = (
+            &'a str,
+            (u32, u32),
+            (f64, f64),
+            &'a [Rect],
+            Size,
+            (u32, u32),
+        );
+        let cases: [Case; 6] = [
+            (
+                "snapped to a neighbour",
+                (1200, 50),
+                (115.4, 0.2),
+                &[neighbour],
+                usable,
+                (1320, 50),
+            ),
+            (
+                "odd usable width rounds the right-edge snap down to even",
+                (2000, 50),
+                (75.0, 0.0),
+                &[],
+                odd,
+                (2080, 50),
+            ),
+            (
+                "snap outside the usable area is clamped back",
+                (0, 50),
+                (-375.0, 0.0),
+                &[left],
+                usable,
+                (0, 50),
+            ),
+            (
+                "negative origin without a candidate",
+                (8, 8),
+                (-50.0, -50.0),
+                &[],
+                usable,
+                (0, 0),
+            ),
+            (
+                "offset rounds half away from zero, clamp rounds down to even",
+                (1000, 500),
+                (3.5, -2.5),
+                &[],
+                usable,
+                (1004, 496),
+            ),
+            (
+                "a release's final offset gives the saved position",
+                (1200, 50),
+                (114.6, 0.0),
+                &[neighbour],
+                usable,
+                (1320, 50),
+            ),
+        ];
+        for (name, start, offset, others, usable, want) in cases {
+            let start = Point {
+                x: start.0,
+                y: start.1,
+            };
+            let want = Point {
+                x: want.0,
+                y: want.1,
+            };
+            let got = drag_position(start, offset, size, others, usable, 10);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn snap_distance_cases() {
+        let cases = [(true, 10, 10), (false, 10, 0), (true, 0, 0)];
+        for (snapping, configured, want) in cases {
+            assert_eq!(
+                snap_distance(snapping, configured),
+                want,
+                "{snapping} {configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_opacity_cases() {
+        let cases = [
+            ("no saved value", None, 100, 100),
+            ("saved value wins", Some(50), 100, 50),
+            ("saved zero wins", Some(0), 100, 0),
+        ];
+        for (name, layout, config, want) in cases {
+            assert_eq!(base_opacity(layout, config), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn opacity_change_cases() {
+        let cases = [
+            ("base 100 enter", 100, false, true, None),
+            ("base 100 leave", 100, true, false, None),
+            ("base 50 enter", 50, false, true, Some(100)),
+            ("base 50 leave", 50, true, false, Some(50)),
+            ("base 50 enter while already hovered", 50, true, true, None),
+            ("base 50 no hover before or after", 50, false, false, None),
+            ("base 0 enter", 0, false, true, Some(100)),
+            ("base 0 leave", 0, true, false, Some(0)),
+        ];
+        for (name, base, before, after, want) in cases {
+            assert_eq!(opacity_change(base, before, after), want, "{name}");
         }
     }
 
@@ -2536,6 +3463,14 @@ mod tests {
                     reason: "not advertised by the compositor".to_string(),
                 },
                 "zwp_relative_pointer_manager_v1: not advertised by the compositor",
+            ),
+            (
+                "alpha modifier global",
+                SetupError::Global {
+                    name: "wp_alpha_modifier_v1",
+                    reason: "missing".to_string(),
+                },
+                "wp_alpha_modifier_v1: missing",
             ),
             (
                 "no output",
