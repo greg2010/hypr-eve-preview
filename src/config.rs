@@ -21,11 +21,15 @@ pub struct Config {
     pub resize: Resize,
 }
 
+/// Thumbnail sizing in pixels. `opacity` is a percentage, 0 to `MAX_OPACITY`, default 100.
+/// `snap_distance` is in logical pixels, default 10; 0 disables snapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thumbnail {
     pub width: u32,
     pub min_width: u32,
     pub max_width: u32,
+    pub opacity: u32,
+    pub snap_distance: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +94,8 @@ impl Default for Config {
                 width: 480,
                 min_width: 160,
                 max_width: 1280,
+                opacity: 100,
+                snap_distance: 10,
             },
             placement: Placement { x: 8, y: 8, gap: 8 },
             border: Border {
@@ -137,6 +143,14 @@ const TABLES: &[Table] = &[
             (
                 "max_width",
                 Setter::Int(|w, n| w.config.thumbnail.max_width = n),
+            ),
+            (
+                "opacity",
+                Setter::Int(|w, n| w.config.thumbnail.opacity = n),
+            ),
+            (
+                "snap_distance",
+                Setter::Int(|w, n| w.config.thumbnail.snap_distance = n),
             ),
         ],
     ),
@@ -252,6 +266,10 @@ fn at_least(key: &str, value: u32, min: u32) -> Result<(), ConfigError> {
     }
 }
 
+/// The one opacity bound and percent scale, shared so that every opacity check and
+/// conversion agrees.
+pub const MAX_OPACITY: u32 = 100;
+
 fn between(key: &str, value: u32, min: u32, max: u32) -> Result<(), ConfigError> {
     if (min..=max).contains(&value) {
         Ok(())
@@ -299,6 +317,7 @@ fn validate(walked: Walked) -> Result<Config, ConfigError> {
     even("thumbnail.min_width", t.min_width)?;
     at_least("thumbnail.min_width", t.min_width, 2)?;
     even("thumbnail.max_width", t.max_width)?;
+    between("thumbnail.opacity", t.opacity, 0, MAX_OPACITY)?;
     even("placement.x", config.placement.x)?;
     even("placement.y", config.placement.y)?;
     even("placement.gap", config.placement.gap)?;
@@ -383,6 +402,8 @@ mod tests {
 width = 480
 min_width = 160
 max_width = 1280
+opacity = 100
+snap_distance = 10
 
 [placement]
 x = 8
@@ -411,6 +432,8 @@ step = 32
 width = 400
 min_width = 100
 max_width = 800
+opacity = 50
+snap_distance = 0
 
 [placement]
 x = 10
@@ -464,6 +487,8 @@ step = 16
                 width: 400,
                 min_width: 100,
                 max_width: 800,
+                opacity: 50,
+                snap_distance: 0,
             },
             placement: Placement {
                 x: 10,
@@ -500,6 +525,8 @@ step = 16
                 width: 480,
                 min_width: 160,
                 max_width: 1280,
+                opacity: 100,
+                snap_distance: 10,
             },
             placement: Placement { x: 8, y: 8, gap: 8 },
             border: Border {
@@ -656,6 +683,29 @@ step = 16
             (
                 "odd max width",
                 "[thumbnail]\nmax_width = 1281\n",
+                key("thumbnail.max_width", "must be even"),
+            ),
+            (
+                "opacity above 100",
+                "[thumbnail]\nopacity = 101\n",
+                key("thumbnail.opacity", "must be between 0 and 100"),
+            ),
+            (
+                "opacity as float",
+                "[thumbnail]\nopacity = 0.5\n",
+                key("thumbnail.opacity", "expected integer"),
+            ),
+            (
+                "negative snap distance",
+                "[thumbnail]\nsnap_distance = -1\n",
+                key(
+                    "thumbnail.snap_distance",
+                    "must be between 0 and 4294967295",
+                ),
+            ),
+            (
+                "odd max width is reported before opacity",
+                "[thumbnail]\nmax_width = 1281\nopacity = 101\n",
                 key("thumbnail.max_width", "must be even"),
             ),
             (
