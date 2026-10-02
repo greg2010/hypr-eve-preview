@@ -1,11 +1,11 @@
 # Maintainer: Grigory Romodanovskiy <greg2008200@gmail.com>
 pkgname=hypr-eve-preview
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Live thumbnails of EVE Online game clients on Hyprland"
 arch=('x86_64')
 license=('MIT')
-depends=('fontconfig' 'glibc' 'hyprland' 'libgcc' 'mesa')
+depends=('dbus' 'fontconfig' 'glibc' 'hyprland' 'libgcc' 'mesa')
 makedepends=('cargo')
 source=()
 sha256sums=()
