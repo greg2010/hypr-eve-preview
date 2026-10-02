@@ -6,7 +6,7 @@ use std::process::Command;
 
 use ab_glyph::{Font as _, PxScale, ScaleFont as _, point};
 
-use crate::config::{self, Color};
+use crate::config::{self, Color, MAX_OPACITY};
 use crate::geometry::{BYTES_PER_PIXEL, Size};
 
 /// A parsed label font, owning the file's bytes.
@@ -78,21 +78,39 @@ pub fn buffer_size(logical: Size, scale: f64) -> Size {
     }
 }
 
+/// What `render` draws: an optional ring of the given width and colour, and a label. `opacity`
+/// is a percent, 0 to `MAX_OPACITY`, scaling the ring and label alpha before premultiplication.
 pub struct Chrome<'a> {
     pub ring: Option<(u32, Color)>,
     pub label: &'a str,
     pub style: &'a config::Label,
     pub scale: f64,
+    pub opacity: u32,
 }
 
 /// Draws the ring and the label into `canvas`, 4 bytes per pixel, `size.width` pixels per row.
-/// Every byte of the canvas is overwritten.
+/// Every byte of the canvas is overwritten. Both colours' alpha is scaled by `chrome.opacity`
+/// percent, at most `MAX_OPACITY`.
 pub fn render(canvas: &mut [u8], size: Size, chrome: &Chrome<'_>, font: &Font) {
     canvas.fill(0);
     if let Some((width, color)) = chrome.ring {
-        draw_ring(canvas, size, width, color, chrome.scale);
+        draw_ring(
+            canvas,
+            size,
+            width,
+            with_opacity(color, chrome.opacity),
+            chrome.scale,
+        );
     }
     draw_label(canvas, size, chrome, font);
+}
+
+fn with_opacity(color: Color, percent: u32) -> Color {
+    let a = (u32::from(color.a) * percent.min(MAX_OPACITY) + MAX_OPACITY / 2) / MAX_OPACITY;
+    Color {
+        a: a as u8,
+        ..color
+    }
 }
 
 fn draw_ring(canvas: &mut [u8], size: Size, width: u32, color: Color, scale: f64) {
@@ -119,7 +137,7 @@ fn draw_label(canvas: &mut [u8], size: Size, chrome: &Chrome<'_>, font: &Font) {
     let scaled = font
         .0
         .as_scaled(PxScale::from((chrome.scale * f64::from(style.size)) as f32));
-    let source = premultiply(style.color);
+    let source = premultiply(with_opacity(style.color, chrome.opacity));
     let mut pen_x = (chrome.scale * f64::from(style.x)) as f32;
     let baseline = (chrome.scale * f64::from(style.y)) as f32 + scaled.ascent();
     let mut previous = None;
@@ -255,6 +273,8 @@ mod tests {
             (
                 "ring width 2 at 1.5",
                 Some((2, GREEN)),
+                100,
+                false,
                 vec![
                     ((0, 0), green),
                     ((2, 200), green),
@@ -267,20 +287,42 @@ mod tests {
                     ((360, 198), clear),
                 ],
             ),
-            ("no ring", None, vec![]),
-            ("ring width 0", Some((0, GREEN)), vec![]),
+            ("no ring", None, 100, true, vec![]),
+            ("ring width 0", Some((0, GREEN)), 100, true, vec![]),
+            (
+                "ring at opacity 50",
+                Some((2, GREEN)),
+                50,
+                false,
+                vec![((2, 200), [0x00, 0x80, 0x20, 0x80])],
+            ),
+            (
+                "ring at opacity 150",
+                Some((2, GREEN)),
+                150,
+                false,
+                vec![((2, 200), green)],
+            ),
+            (
+                "ring at opacity 0",
+                Some((2, GREEN)),
+                0,
+                true,
+                vec![((2, 200), clear)],
+            ),
         ];
         let font = noto();
-        for (name, ring, pixels) in cases {
+        for (name, ring, opacity, all_zero, pixels) in cases {
             let chrome = Chrome {
                 ring,
                 label: "",
                 style: &style,
                 scale: 1.5,
+                opacity,
             };
             let mut canvas = vec![0xAA; 720 * 396 * BYTES_PER_PIXEL];
             render(&mut canvas, size, &chrome, &font);
-            if pixels.is_empty() {
+            if all_zero {
                 assert_eq!(canvas, vec![0u8; 720 * 396 * BYTES_PER_PIXEL], "{name}");
             }
             for ((x, y), want) in pixels {
@@ -298,19 +340,23 @@ mod tests {
         let style = style();
         let font = noto();
         let cases = [
-            ("label", "Pilot One", true),
-            ("outline-less glyphs", "   ", false),
-            ("empty label", "", false),
+            ("label", "Pilot One", 100, Some(0xFF)),
+            ("label W at opacity 50", "W", 50, Some(0x80)),
+            ("label at opacity 150", "Pilot One", 150, Some(0xFF)),
+            ("outline-less glyphs", "   ", 100, None),
+            ("empty label", "", 100, None),
         ];
-        for (name, label, drawn) in cases {
+        for (name, label, opacity, alpha_max) in cases {
             let chrome = Chrome {
                 ring: None,
                 label,
                 style: &style,
                 scale: 1.5,
+                opacity,
             };
             let mut canvas = vec![0xAA; 720 * 396 * BYTES_PER_PIXEL];
             render(&mut canvas, size, &chrome, &font);
+            let mut max_alpha = 0;
             let mut bounds: Option<(u32, u32, u32, u32)> = None;
             let mut blue = Vec::new();
             for y in 0..396 {
@@ -320,19 +366,21 @@ mod tests {
                         continue;
                     }
                     blue.push(p[0]);
+                    max_alpha = max_alpha.max(p[3]);
                     bounds = Some(match bounds {
                         None => (x, y, x, y),
                         Some((l, t, r, b)) => (l.min(x), t.min(y), r.max(x), b.max(y)),
                     });
                 }
             }
-            if drawn {
+            if let Some(alpha_max) = alpha_max {
                 let (l, t, r, b) = bounds.unwrap();
                 assert!(
                     l >= 9 && t >= 9 && r < 720 && b < 54,
                     "{name}: {l},{t},{r},{b}"
                 );
                 assert!(blue.iter().all(|&v| v == 0), "{name}: blue channel");
+                assert_eq!(max_alpha, alpha_max, "{name}: max alpha");
             } else {
                 assert_eq!(canvas, vec![0u8; 720 * 396 * BYTES_PER_PIXEL], "{name}");
             }

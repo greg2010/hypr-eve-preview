@@ -15,10 +15,13 @@ use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Dispatch, QueueHandle};
+use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1;
+use wayland_protocols::wp::alpha_modifier::v1::client::wp_alpha_modifier_v1::WpAlphaModifierV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 
+use crate::config::MAX_OPACITY;
 use crate::geometry::{BYTES_PER_PIXEL, Point, Size};
 
 #[derive(Debug)]
@@ -54,6 +57,7 @@ pub struct Overlay {
     chrome_surface: WlSurface,
     chrome_viewport: WpViewport,
     chrome_buffer: Option<Buffer>,
+    alpha: WpAlphaModifierSurfaceV1,
     pool: SlotPool,
     size: Size,
     position: Point,
@@ -68,22 +72,26 @@ pub struct Globals<'a> {
     pub viewporter: &'a WpViewporter,
     pub shm: &'a Shm,
     pub output: &'a WlOutput,
+    pub alpha: &'a WpAlphaModifierV1,
 }
 
 impl Overlay {
     /// Creates both surfaces and sends the initial layer commit with no buffer. The layer's
-    /// input region is left unset; the chrome's is empty before its first commit.
+    /// input region is left unset; the chrome's is empty before its first commit. `factor` is the
+    /// alpha multiplier from `alpha_factor`, applied to the surface before its first commit.
     pub fn new<D>(
         qh: &QueueHandle<D>,
         globals: &Globals<'_>,
         position: Point,
         size: Size,
+        factor: u32,
     ) -> Result<Overlay, OverlayError>
     where
         D: Dispatch<WlSurface, SurfaceData<()>>
             + Dispatch<ZwlrLayerSurfaceV1, LayerSurfaceData>
             + Dispatch<WpViewport, ()>
             + Dispatch<WlSubsurface, SubsurfaceData>
+            + Dispatch<WpAlphaModifierSurfaceV1, ()>
             + 'static,
     {
         let surface = globals.compositor.create_surface(qh);
@@ -99,7 +107,6 @@ impl Overlay {
         layer.set_exclusive_zone(0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(size.width, size.height);
-        let viewport = globals.viewporter.get_viewport(layer.wl_surface(), qh, ());
 
         let (chrome_subsurface, chrome_surface) = globals
             .subcompositor
@@ -112,6 +119,9 @@ impl Overlay {
             (size.width as usize * size.height as usize * BYTES_PER_PIXEL).max(MIN_POOL_BYTES);
         let pool = SlotPool::new(pool_bytes, globals.shm).map_err(OverlayError::Pool)?;
 
+        let viewport = globals.viewporter.get_viewport(layer.wl_surface(), qh, ());
+        let alpha = globals.alpha.get_surface(layer.wl_surface(), qh, ());
+        alpha.set_multiplier(factor);
         layer.wl_surface().commit();
         Ok(Overlay {
             layer,
@@ -120,6 +130,7 @@ impl Overlay {
             chrome_surface,
             chrome_viewport,
             chrome_buffer: None,
+            alpha,
             pool,
             size,
             position,
@@ -243,14 +254,20 @@ impl Overlay {
         self.layer.wl_surface().commit();
     }
 
+    /// Sends the multiplier only; the next layer commit applies it.
+    pub fn set_alpha(&mut self, factor: u32) {
+        self.alpha.set_multiplier(factor);
+    }
+
     /// Layer commit that applies a chrome-only render.
     pub fn commit(&mut self) {
         self.layer.wl_surface().commit();
     }
 
-    /// Destroys the chrome viewport, subsurface, surface and pool, then the viewport, the
-    /// layer surface and the `wl_surface`.
+    /// Destroys the alpha object first, then the chrome viewport, subsurface, surface and pool,
+    /// then the viewport, the layer surface and the `wl_surface`.
     pub fn destroy(self) {
+        self.alpha.destroy();
         self.chrome_viewport.destroy();
         self.chrome_subsurface.destroy();
         self.chrome_surface.destroy();
@@ -258,5 +275,31 @@ impl Overlay {
         drop(self.pool);
         self.viewport.destroy();
         drop(self.layer);
+    }
+}
+
+/// The protocol multiplier for an opacity of `percent`, at most `MAX_OPACITY`: `u32::MAX` scaled
+/// and rounded down.
+pub fn alpha_factor(percent: u32) -> u32 {
+    (u64::from(u32::MAX) * u64::from(percent.min(MAX_OPACITY)) / u64::from(MAX_OPACITY)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpha_factor_cases() {
+        let cases = [
+            ("zero", 0, 0),
+            ("one", 1, 42_949_672),
+            ("half", 50, 2_147_483_647),
+            ("ninety-nine", 99, 4_252_017_622),
+            ("full", 100, 4_294_967_295),
+            ("above max", 101, 4_294_967_295),
+        ];
+        for (name, percent, want) in cases {
+            assert_eq!(alpha_factor(percent), want, "{name}");
+        }
     }
 }
