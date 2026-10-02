@@ -67,6 +67,10 @@ enum State {
     Pressed {
         address: u64,
         delta: (f64, f64),
+        locked: bool,
+    },
+    Inert {
+        address: u64,
     },
     Dragging {
         address: u64,
@@ -81,15 +85,24 @@ enum State {
 }
 
 /// The gesture machine of the pointer. It holds the active gesture, the wheel remainder per
-/// thumbnail and the cursor shape last requested.
+/// thumbnail and the cursor shape last requested. A locked machine keeps the cursor default,
+/// lets an active gesture complete and applies the lock from the next press.
 #[derive(Debug, Default)]
 pub struct Gestures {
     state: State,
     wheel: HashMap<u64, i32>,
     cursor: Option<Cursor>,
+    locked: bool,
 }
 
 impl Gestures {
+    /// Sets the lock. It emits no effect and leaves the active gesture and the wheel remainders
+    /// alone: the lock at the press decides a gesture, and the cursor shape follows the next
+    /// pointer event.
+    pub fn set_locked(&mut self, locked: bool) {
+        self.locked = locked;
+    }
+
     /// Feeds one pointer input and returns the effects it causes, in order. Each effect names a
     /// client the machine has not been told was removed.
     pub fn handle(&mut self, input: PointerInput) -> Vec<Effect> {
@@ -129,6 +142,7 @@ impl Gestures {
         match self.state {
             State::Idle => None,
             State::Pressed { address, .. }
+            | State::Inert { address }
             | State::Dragging { address, .. }
             | State::Resizing { address, .. } => Some(address),
         }
@@ -146,7 +160,7 @@ impl Gestures {
         if self.state != State::Idle {
             return vec![];
         }
-        self.set_cursor(if in_grip {
+        self.set_cursor(if in_grip && !self.locked {
             Cursor::SeResize
         } else {
             Cursor::Default
@@ -195,7 +209,7 @@ impl Gestures {
                 effects.push(Effect::ResizeEnd { address });
                 effects
             }
-            State::Idle | State::Pressed { .. } => vec![],
+            State::Idle | State::Pressed { .. } | State::Inert { .. } => vec![],
         }
     }
 
@@ -204,7 +218,7 @@ impl Gestures {
             return vec![];
         }
         let delta = (0.0, 0.0);
-        if in_grip {
+        if in_grip && !self.locked {
             self.state = State::Resizing {
                 address,
                 delta,
@@ -212,7 +226,11 @@ impl Gestures {
             };
             self.set_cursor(Cursor::SeResize)
         } else {
-            self.state = State::Pressed { address, delta };
+            self.state = State::Pressed {
+                address,
+                delta,
+                locked: self.locked,
+            };
             vec![]
         }
     }
@@ -223,7 +241,7 @@ impl Gestures {
         }
         let state = std::mem::take(&mut self.state);
         let mut effects = match state {
-            State::Idle => return vec![],
+            State::Idle | State::Inert { .. } => return vec![],
             State::Pressed { address, .. } => return vec![Effect::Click { address }],
             State::Dragging { .. } | State::Resizing { .. } => Self::end_gesture(state),
         };
@@ -233,20 +251,31 @@ impl Gestures {
 
     fn relative(&mut self, dx: f64, dy: f64) -> Vec<Effect> {
         match &mut self.state {
-            State::Idle => vec![],
-            State::Pressed { address, delta } => {
-                let address = *address;
+            State::Idle | State::Inert { .. } => vec![],
+            State::Pressed {
+                address,
+                delta,
+                locked,
+            } => {
+                let (address, locked) = (*address, *locked);
                 let delta = (delta.0 + dx, delta.1 + dy);
-                if delta.0.hypot(delta.1) >= DRAG_THRESHOLD {
+                if delta.0.hypot(delta.1) < DRAG_THRESHOLD {
+                    self.state = State::Pressed {
+                        address,
+                        delta,
+                        locked,
+                    };
+                    vec![]
+                } else if locked {
+                    self.state = State::Inert { address };
+                    vec![]
+                } else {
                     self.state = State::Dragging {
                         address,
                         delta,
                         sent: (0.0, 0.0),
                     };
                     self.set_cursor(Cursor::Grabbing)
-                } else {
-                    self.state = State::Pressed { address, delta };
-                    vec![]
                 }
             }
             State::Dragging { delta, .. } | State::Resizing { delta, .. } => {
@@ -258,7 +287,7 @@ impl Gestures {
     }
 
     fn axis(&mut self, address: u64, value120: i32, discrete: i32) -> Vec<Effect> {
-        if self.state != State::Idle {
+        if self.locked || self.state != State::Idle {
             return vec![];
         }
         let steps = if value120 != 0 {
@@ -628,35 +657,199 @@ mod tests {
         run("gesture_cases", cases);
     }
 
+    enum Lock {
+        Set(bool),
+        Input(PointerInput, Vec<Effect>),
+    }
+
+    #[test]
+    fn lock_cases() {
+        use Lock::{Input, Set};
+        let grip_press = || press(A, BTN_LEFT, true);
+        let body_press = || press(A, BTN_LEFT, false);
+        let cases: Vec<(&str, Vec<Lock>)> = vec![
+            (
+                "locked enter",
+                vec![Set(true), Input(enter(A), vec![cursor(Cursor::Default)])],
+            ),
+            (
+                "locked grip motion",
+                vec![
+                    Set(true),
+                    Input(motion(true), vec![cursor(Cursor::Default)]),
+                ],
+            ),
+            (
+                "locked grip press is a click",
+                vec![
+                    Set(true),
+                    Input(grip_press(), vec![]),
+                    Input(release(), vec![Effect::Click { address: A }]),
+                ],
+            ),
+            (
+                "locked press moved 6 px goes inert",
+                vec![
+                    Set(true),
+                    Input(body_press(), vec![]),
+                    Input(rel(6.0, 0.0), vec![]),
+                    Input(PointerInput::FrameEnd, vec![]),
+                    Input(release(), vec![]),
+                ],
+            ),
+            (
+                "locked grip press moved 6 px goes inert",
+                vec![
+                    Set(true),
+                    Input(grip_press(), vec![]),
+                    Input(rel(6.0, 0.0), vec![]),
+                    Input(PointerInput::FrameEnd, vec![]),
+                    Input(release(), vec![]),
+                ],
+            ),
+            (
+                "locked wheel keeps the remainder",
+                vec![
+                    Input(axis(60, 0), vec![]),
+                    Set(true),
+                    Input(axis(60, 0), vec![]),
+                    Set(false),
+                    Input(
+                        axis(60, 0),
+                        vec![Effect::Resize {
+                            address: A,
+                            steps: -1,
+                        }],
+                    ),
+                ],
+            ),
+            (
+                "drag started unlocked completes after lock",
+                vec![
+                    Input(body_press(), vec![]),
+                    Input(rel(6.0, 0.0), vec![cursor(Cursor::Grabbing)]),
+                    Set(true),
+                    Input(rel(2.0, 0.0), vec![]),
+                    Input(
+                        PointerInput::FrameEnd,
+                        vec![Effect::Drag {
+                            address: A,
+                            offset: (8.0, 0.0),
+                        }],
+                    ),
+                    Input(
+                        release(),
+                        vec![Effect::DragEnd { address: A }, cursor(Cursor::Default)],
+                    ),
+                ],
+            ),
+            (
+                "resize started unlocked completes after lock",
+                vec![
+                    Input(grip_press(), vec![cursor(Cursor::SeResize)]),
+                    Set(true),
+                    Input(rel(10.0, 0.0), vec![]),
+                    Input(
+                        PointerInput::FrameEnd,
+                        vec![Effect::ResizeTo {
+                            address: A,
+                            dx: 10.0,
+                        }],
+                    ),
+                    Input(
+                        release(),
+                        vec![Effect::ResizeEnd { address: A }, cursor(Cursor::Default)],
+                    ),
+                ],
+            ),
+            (
+                "press taken locked stays inert after unlock",
+                vec![
+                    Set(true),
+                    Input(body_press(), vec![]),
+                    Set(false),
+                    Input(rel(6.0, 0.0), vec![]),
+                    Input(release(), vec![]),
+                ],
+            ),
+            (
+                "grip cursor turns default at the next motion",
+                vec![
+                    Input(motion(true), vec![cursor(Cursor::SeResize)]),
+                    Set(true),
+                    Input(motion(true), vec![cursor(Cursor::Default)]),
+                ],
+            ),
+        ];
+        for (name, script) in cases {
+            let mut gestures = Gestures::default();
+            for (i, step) in script.into_iter().enumerate() {
+                match step {
+                    Set(locked) => gestures.set_locked(locked),
+                    Input(input, want) => {
+                        let got = gestures.handle(input);
+                        assert_eq!(got, want, "lock_cases/{name} step {i}: {input:?}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn active_cases() {
-        let cases: Vec<(&str, Vec<PointerInput>, Option<u64>)> = vec![
-            ("idle", vec![], None),
-            ("entered", vec![enter(A)], None),
+        let cases: Vec<(&str, bool, Vec<PointerInput>, Option<u64>)> = vec![
+            ("idle", false, vec![], None),
+            ("entered", false, vec![enter(A)], None),
             (
                 "body_press_below_threshold",
+                false,
                 vec![press(A, BTN_LEFT, false), rel(1.0, 0.0)],
                 Some(A),
             ),
             (
                 "drag",
+                false,
                 vec![press(A, BTN_LEFT, false), rel(5.0, 0.0)],
                 Some(A),
             ),
-            ("resize_press", vec![press(B, BTN_LEFT, true)], Some(B)),
+            (
+                "resize_press",
+                false,
+                vec![press(B, BTN_LEFT, true)],
+                Some(B),
+            ),
             (
                 "after_release",
+                false,
                 vec![press(A, BTN_LEFT, false), release()],
                 None,
             ),
             (
                 "after_leave",
+                false,
                 vec![press(A, BTN_LEFT, false), rel(5.0, 0.0), leave(A)],
                 None,
             ),
+            (
+                "locked press moved 6 px is active",
+                true,
+                vec![press(A, BTN_LEFT, false), rel(6.0, 0.0)],
+                Some(A),
+            ),
+            (
+                "inert gesture removed",
+                true,
+                vec![
+                    press(A, BTN_LEFT, false),
+                    rel(6.0, 0.0),
+                    PointerInput::Removed { address: A },
+                ],
+                None,
+            ),
         ];
-        for (name, inputs, want) in cases {
+        for (name, locked, inputs, want) in cases {
             let mut gestures = Gestures::default();
+            gestures.set_locked(locked);
             for input in inputs {
                 gestures.handle(input);
             }
