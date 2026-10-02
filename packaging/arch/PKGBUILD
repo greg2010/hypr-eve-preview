@@ -1,0 +1,45 @@
+# Maintainer: Grigory Romodanovskiy <greg2008200@gmail.com>
+pkgname=hypr-eve-preview
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Live thumbnails of EVE Online game clients on Hyprland"
+arch=('x86_64')
+license=('MIT')
+depends=('fontconfig' 'glibc' 'hyprland' 'libgcc' 'mesa')
+makedepends=('cargo')
+source=()
+sha256sums=()
+
+prepare() {
+  rm -rf "$srcdir/$pkgname"
+  mkdir -p "$srcdir/$pkgname"
+  cp -a "$startdir/../../"{Cargo.toml,Cargo.lock,LICENSE,src,protocols,testdata,docs} "$srcdir/$pkgname/"
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+pkgver() {
+  sed -n 's/^version = "\(.*\)"/\1/p' "$srcdir/$pkgname/Cargo.toml" | head -n 1 | tr - _
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "target/release/hypr-eve-preview" "$pkgdir/usr/bin/hypr-eve-preview"
+  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
