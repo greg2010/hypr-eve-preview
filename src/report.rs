@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::control;
 use crate::dmabuf::fourcc_text;
 use crate::geometry::{Rect, Size};
 
@@ -25,6 +26,25 @@ pub enum DamageMode {
     IgnoreDamage,
 }
 
+/// What triggered a state change. It tags the lock, visibility, snap and opacity lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Tray,
+    Socket,
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Source::Tray => "tray",
+            Source::Socket => "socket",
+        })
+    }
+}
+
+/// One report line. `Display` renders its exact text, without the program prefix.
+/// The reporter writes each line of a level it emits to stderr and, when set, the log file.
+/// A verbose line is emitted only when the reporter is verbose.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Line {
     Start {
@@ -34,6 +54,7 @@ pub enum Line {
         mode: DamageMode,
         config: Option<PathBuf>,
         layout: PathBuf,
+        locked: bool,
         font: PathBuf,
     },
     ClientAdded {
@@ -120,9 +141,44 @@ pub enum Line {
         code: u8,
         reason: String,
     },
+    Lock {
+        locked: bool,
+        source: Source,
+    },
+    Visibility {
+        hidden: bool,
+        source: Source,
+    },
+    Snap {
+        snapping: bool,
+        source: Source,
+    },
+    Opacity {
+        percent: u32,
+        source: Source,
+    },
+    TrayRegistered {
+        name: String,
+    },
+    TrayUnavailable {
+        reason: String,
+    },
+    ControlListening {
+        path: PathBuf,
+    },
+    ControlError {
+        error: String,
+    },
 }
 
-const SYNTAX: &str = "hypr-eve-preview [--config <path>] [--log <path>] [--verbose] [--seconds <N>] [--ignore-damage]";
+fn syntax() -> String {
+    let words = control::COMMANDS.map(control::Command::word).join("|");
+    format!(
+        "hypr-eve-preview [--config <path>] [--log <path>] [--verbose] [--seconds <N>] \
+         [--ignore-damage] | hypr-eve-preview {words}|{} <N>",
+        control::OPACITY_WORD
+    )
+}
 
 fn json(s: &str) -> Result<String, fmt::Error> {
     serde_json::to_string(s).map_err(|_| fmt::Error)
@@ -163,6 +219,7 @@ impl fmt::Display for Line {
                 mode,
                 config,
                 layout,
+                locked,
                 font,
             } => {
                 let mode = match mode {
@@ -176,7 +233,7 @@ impl fmt::Display for Line {
                 write!(
                     f,
                     "start output={output} scale={scale} usable={},{},{}x{} mode={mode} \
-                     config={config} layout={} font={}",
+                     config={config} layout={} locked={locked} font={}",
                     usable.x,
                     usable.y,
                     usable.width,
@@ -332,11 +389,39 @@ impl fmt::Display for Line {
                 waited.as_micros()
             ),
             Line::Usage { message } => {
-                write!(f, "usage message={} syntax=\"{SYNTAX}\"", json(message)?)
+                write!(
+                    f,
+                    "usage message={} syntax=\"{}\"",
+                    json(message)?,
+                    syntax()
+                )
             }
             Line::Exit { code, reason } => {
                 write!(f, "exit code={code} reason={}", json(reason)?)
             }
+            Line::Lock { locked, source } => {
+                let state = if *locked { "on" } else { "off" };
+                write!(f, "lock state={state} source={source}")
+            }
+            Line::Snap { snapping, source } => {
+                let state = if *snapping { "on" } else { "off" };
+                write!(f, "snap state={state} source={source}")
+            }
+            Line::Visibility { hidden, source } => {
+                let state = if *hidden { "hidden" } else { "shown" };
+                write!(f, "visibility state={state} source={source}")
+            }
+            Line::Opacity { percent, source } => {
+                write!(f, "opacity percent={percent} source={source}")
+            }
+            Line::TrayRegistered { name } => write!(f, "tray-registered name={}", json(name)?),
+            Line::TrayUnavailable { reason } => {
+                write!(f, "tray-unavailable reason={}", json(reason)?)
+            }
+            Line::ControlListening { path } => {
+                write!(f, "control-listening path={}", json_path(path)?)
+            }
+            Line::ControlError { error } => write!(f, "control-error error={}", json(error)?),
         }
     }
 }
@@ -424,10 +509,11 @@ mod tests {
                     mode: DamageMode::Recommit,
                     config: None,
                     layout: "/s/hypr-eve-preview/layout.json".into(),
+                    locked: false,
                     font: "/usr/share/fonts/noto/NotoSansMono-Regular.ttf".into(),
                 },
                 Default,
-                "start output=DP-3 scale=1.5 usable=0,34,2560x1406 mode=recommit config=- layout=\"/s/hypr-eve-preview/layout.json\" font=\"/usr/share/fonts/noto/NotoSansMono-Regular.ttf\"",
+                "start output=DP-3 scale=1.5 usable=0,34,2560x1406 mode=recommit config=- layout=\"/s/hypr-eve-preview/layout.json\" locked=false font=\"/usr/share/fonts/noto/NotoSansMono-Regular.ttf\"",
             ),
             (
                 "start with config and ignore-damage",
@@ -443,10 +529,143 @@ mod tests {
                     mode: DamageMode::IgnoreDamage,
                     config: Some("/c/config.toml".into()),
                     layout: "/s/l.json".into(),
+                    locked: false,
                     font: "/f.ttf".into(),
                 },
                 Default,
-                "start output=HDMI-A-1 scale=2 usable=10,20,1880x1020 mode=ignore-damage config=\"/c/config.toml\" layout=\"/s/l.json\" font=\"/f.ttf\"",
+                "start output=HDMI-A-1 scale=2 usable=10,20,1880x1020 mode=ignore-damage config=\"/c/config.toml\" layout=\"/s/l.json\" locked=false font=\"/f.ttf\"",
+            ),
+            (
+                "start locked",
+                Line::Start {
+                    output: "DP-3".into(),
+                    scale: 1.5,
+                    usable: Rect {
+                        x: 0,
+                        y: 34,
+                        width: 2560,
+                        height: 1406,
+                    },
+                    mode: DamageMode::Recommit,
+                    config: None,
+                    layout: "/s/l.json".into(),
+                    locked: true,
+                    font: "/f.ttf".into(),
+                },
+                Default,
+                "start output=DP-3 scale=1.5 usable=0,34,2560x1406 mode=recommit config=- layout=\"/s/l.json\" locked=true font=\"/f.ttf\"",
+            ),
+            (
+                "opacity from the socket",
+                Line::Opacity {
+                    percent: 50,
+                    source: Source::Socket,
+                },
+                Default,
+                "opacity percent=50 source=socket",
+            ),
+            (
+                "opacity from the tray",
+                Line::Opacity {
+                    percent: 100,
+                    source: Source::Tray,
+                },
+                Default,
+                "opacity percent=100 source=tray",
+            ),
+            (
+                "lock on from the socket",
+                Line::Lock {
+                    locked: true,
+                    source: Source::Socket,
+                },
+                Default,
+                "lock state=on source=socket",
+            ),
+            (
+                "lock off from the tray",
+                Line::Lock {
+                    locked: false,
+                    source: Source::Tray,
+                },
+                Default,
+                "lock state=off source=tray",
+            ),
+            (
+                "snap off from the tray",
+                Line::Snap {
+                    snapping: false,
+                    source: Source::Tray,
+                },
+                Default,
+                "snap state=off source=tray",
+            ),
+            (
+                "snap on from the socket",
+                Line::Snap {
+                    snapping: true,
+                    source: Source::Socket,
+                },
+                Default,
+                "snap state=on source=socket",
+            ),
+            (
+                "visibility hidden from the tray",
+                Line::Visibility {
+                    hidden: true,
+                    source: Source::Tray,
+                },
+                Default,
+                "visibility state=hidden source=tray",
+            ),
+            (
+                "visibility shown from the socket",
+                Line::Visibility {
+                    hidden: false,
+                    source: Source::Socket,
+                },
+                Default,
+                "visibility state=shown source=socket",
+            ),
+            (
+                "tray-registered",
+                Line::TrayRegistered {
+                    name: "org.kde.StatusNotifierItem-4242-1".into(),
+                },
+                Default,
+                "tray-registered name=\"org.kde.StatusNotifierItem-4242-1\"",
+            ),
+            (
+                "tray-unavailable",
+                Line::TrayUnavailable {
+                    reason: "session bus: x".into(),
+                },
+                Default,
+                "tray-unavailable reason=\"session bus: x\"",
+            ),
+            (
+                "tray-unavailable with a quote",
+                Line::TrayUnavailable {
+                    reason: "register: \"x\"".into(),
+                },
+                Default,
+                "tray-unavailable reason=\"register: \\\"x\\\"\"",
+            ),
+            (
+                "control-listening",
+                Line::ControlListening {
+                    path: "/run/user/1000/hypr/sig/.hypr-eve-preview.sock".into(),
+                },
+                Default,
+                "control-listening path=\"/run/user/1000/hypr/sig/.hypr-eve-preview.sock\"",
+            ),
+            (
+                "control-error",
+                Line::ControlError {
+                    error: "unknown command".into(),
+                },
+                Default,
+                "control-error error=\"unknown command\"",
             ),
             (
                 "client-added with slot and account",
@@ -678,7 +897,7 @@ mod tests {
                     message: "unknown flag --help".into(),
                 },
                 Default,
-                "usage message=\"unknown flag --help\" syntax=\"hypr-eve-preview [--config <path>] [--log <path>] [--verbose] [--seconds <N>] [--ignore-damage]\"",
+                "usage message=\"unknown flag --help\" syntax=\"hypr-eve-preview [--config <path>] [--log <path>] [--verbose] [--seconds <N>] [--ignore-damage] | hypr-eve-preview lock|unlock|hide|show|toggle-lock|toggle-hide|snap|unsnap|toggle-snap|opacity <N>\"",
             ),
             (
                 "exit",
