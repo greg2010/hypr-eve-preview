@@ -13,7 +13,7 @@ sha256sums=()
 prepare() {
   rm -rf "$srcdir/$pkgname"
   mkdir -p "$srcdir/$pkgname"
-  cp -a "$startdir/../../"{Cargo.toml,Cargo.lock,LICENSE,src,protocols,testdata,docs} "$srcdir/$pkgname/"
+  cp -a "$startdir/../../"{Cargo.toml,Cargo.lock,LICENSE,README.md,src,protocols,testdata,docs} "$srcdir/$pkgname/"
   cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
@@ -40,6 +40,7 @@ check() {
 package() {
   cd "$srcdir/$pkgname"
   install -Dm755 "target/release/hypr-eve-preview" "$pkgdir/usr/bin/hypr-eve-preview"
-  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/docs/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

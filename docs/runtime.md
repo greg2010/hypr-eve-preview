@@ -137,7 +137,7 @@ The bounded splits keep commas inside the last field. `clients` changes nothing 
 - **`exit`.** Every daemon exit goes through `finish`, which builds the line with `report::exit_line`, prints it and calls `process::exit` with its code. Before `App` exists, `fail` calls `finish` directly; afterwards `App::shutdown` does. A teardown error (control socket removal, Wayland flush) is appended as `; teardown: <error>` and raises code 0 to 1.
 - **Write failure.** A failed write to either sink stops the daemon with exit 1 and no `exit` line, also after a log-only failure while stderr still works. Before `App` exists `emit_or_finish` exits 1; inside `App` the stop becomes `StderrFailed`, which overrides the earlier reason and also wins when a line written during shutdown fails. `finish` then exits 1 without an `exit` line. A failed `exit` line write also exits 1.
 - **Guarantee.** The daemon's last line is `exit` unless a report write failed. The command form prints nothing on success, only `exit` on a failure, and `usage` then `exit` on a usage error.
-- **Codes.** The stop site picks the code: 0 for a signal, the tray `Quit` and `--seconds`; 2 only for usage, config and `label.font_file` errors, all before the loop; 1 for everything else, plus the teardown and write-failure rules above. The line catalogue and the cause table are in [hypr-eve-preview.md](hypr-eve-preview.md).
+- **Codes.** The stop site picks the code: 0 for a signal, the tray `Quit` and `--seconds`; 2 only for usage, config and `label.font_file` errors, all before the loop; 1 for everything else, plus the teardown and write-failure rules above. The line catalogue is in the [README](../README.md#report-lines) and the cause table in the [README](../README.md#exit-codes).
 
 ## Components
 

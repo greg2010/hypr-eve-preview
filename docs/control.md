@@ -2,7 +2,7 @@
 
 ## Scope
 
-The control plane carries lock, hide, snap, opacity and quit requests into the daemon and carries the result back. It has three modules: `control` (the control socket server, the command words and the command-form client), `tray` (the tray item and its menu on the session bus) and `cli` (the argument grammar that selects the daemon or the command form). A request ends at `App`, which applies it; the reply goes back as a socket reply or a menu update. [architecture.md](architecture.md) has the whole-app view; the operator's view of the same contract is in [hypr-eve-preview.md](hypr-eve-preview.md).
+The control plane carries lock, hide, snap, opacity and quit requests into the daemon and carries the result back. It has three modules: `control` (the control socket server, the command words and the command-form client), `tray` (the tray item and its menu on the session bus) and `cli` (the argument grammar that selects the daemon or the command form). A request ends at `App`, which applies it; the reply goes back as a socket reply or a menu update. [architecture.md](architecture.md) has the whole-app view; the operator's view of the same contract is in the [README](../README.md#control-socket).
 
 ## From a command to a reply
 

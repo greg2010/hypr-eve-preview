@@ -1,6 +1,6 @@
 # hypr-eve-preview architecture
 
-How the daemon works, by component, for a reader about to change it. The CLI flags, config keys, layout file format, report lines, Hyprland config lines, control commands and tray menu are in the operator reference, [hypr-eve-preview.md](hypr-eve-preview.md).
+How the daemon works, by component, for a reader about to change it. The CLI flags, config keys, layout file format, report lines, Hyprland config lines, control commands and tray menu are in the operator manual, the [README](../README.md).
 
 ## Purpose and shape
 

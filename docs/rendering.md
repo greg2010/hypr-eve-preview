@@ -98,7 +98,7 @@ No surface asks for frame callbacks. Each client paces itself on its capture tim
 | The capture timer cannot join the event loop (`event loop: <error>`); the dmabuf params object cannot be created | exit 1 | | `exit` |
 | An action whose frame, overlay or buffer is missing | exit 1 | | `exit` |
 
-A `ready` resets the count. A `failed` that arrives while the machine is idle is ignored. The reasons and fields are in the operator reference, [hypr-eve-preview.md](hypr-eve-preview.md).
+A `ready` resets the count. A `failed` that arrives while the machine is idle is ignored. The reasons and fields are in the [README](../README.md#report-lines).
 
 ## Components
 
