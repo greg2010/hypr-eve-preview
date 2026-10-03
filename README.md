@@ -33,6 +33,10 @@ cargo install --path . --locked
 
 Run it from the repository root. The binary lands in `~/.cargo/bin` by default. This route installs the binary only.
 
+### Prebuilt binaries
+
+Tagged releases publish x86_64 and aarch64 Linux builds on the GitHub Releases page, https://github.com/greg2010/hypr-eve-preview/releases, as `hypr-eve-preview-<tag>-<triple>.tar.gz` with a `.sha256` beside each. The tarball holds the binary, the docs and the license. At run time it needs the Requirements above, except the Rust toolchain, pkg-config and the development files, which only a build needs.
+
 ## Hyprland setup
 
 Add these lines to `hyprland.conf`. The tool never edits it.

@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  TAG: ${{ github.ref_name }}
+  GH_REPO: ${{ github.repository }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check that the tag matches the crate version
+        run: |
+          version="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "hypr-eve-preview") | .version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$TAG" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes "${prerelease[@]}"
+          fi
+
+  build:
+    needs: release
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    env:
+      TRIPLE: ${{ matrix.triple }}
+    steps:
+      - *checkout
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgbm-dev libdbus-1-dev
+      - name: Build
+        run: cargo build --release --locked --target "$TRIPLE"
+      - name: Package
+        run: |
+          name="hypr-eve-preview-$TAG-$TRIPLE"
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist/$name"
+          cp "target/$TRIPLE/release/hypr-eve-preview" README.md LICENSE "$dist/$name/"
+          cp -r docs "$dist/$name/docs"
+          tar -C "$dist" --owner=0 --group=0 -czf "$dist/$name.tar.gz" "$name"
+          (cd "$dist" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - &check-tag
+        name: Check that the tag still names the built commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(gh api "repos/$GH_REPO/commits/refs/tags/$TAG" --jq .sha)"
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "tag $TAG is at $sha, this run built $GITHUB_SHA" >&2
+            exit 1
+          fi
+      - name: Upload the assets
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP"/dist/*.tar.gz.sha256 --clobber
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - *check-tag
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false
