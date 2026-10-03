@@ -14,12 +14,16 @@ use crate::geometry::{Point, Rect, Size};
 
 pub const SAVE_INTERVAL: Duration = Duration::from_millis(500);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A thumbnail's saved place: `x` and `y` are logical px from the top-left of the usable area of
+/// the monitor named `output`. A file without `output` loads onto the default monitor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub x: u32,
     pub y: u32,
     pub width: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 /// The layout file: the `locked` and `snapping` flags and an optional base thumbnail `opacity`
@@ -129,8 +133,12 @@ pub fn save(path: &Path, file: &LayoutFile) -> Result<(), LayoutError> {
     write().map_err(LayoutError::Write)
 }
 
-pub fn even_down(value: u32) -> u32 {
-    value & !1
+/// Rounds toward negative infinity to an even number.
+pub fn even_down<T>(value: T) -> T
+where
+    T: std::ops::BitAnd<Output = T> + std::ops::Not<Output = T> + From<u8>,
+{
+    value & !T::from(1)
 }
 
 /// Rounds down to even, then clamps to `min_width` and the smaller of `max_width` and the
@@ -205,7 +213,7 @@ pub fn default_position(index: usize, placement: &config::Placement, width: u32)
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyChange {
     Saved,
     Apply(Entry),
@@ -225,7 +233,7 @@ pub fn key_change(
         return KeyChange::Saved;
     }
     match file.entries.get(key) {
-        Some(entry) => KeyChange::Apply(*entry),
+        Some(entry) => KeyChange::Apply(entry.clone()),
         None => KeyChange::Default,
     }
 }
@@ -276,7 +284,12 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn entry(x: u32, y: u32, width: u32) -> Entry {
-        Entry { x, y, width }
+        Entry {
+            x,
+            y,
+            width,
+            output: None,
+        }
     }
 
     fn file(entries: &[(&str, Entry)]) -> LayoutFile {
@@ -286,7 +299,7 @@ mod tests {
             opacity: None,
             entries: entries
                 .iter()
-                .map(|(k, e)| ((*k).to_string(), *e))
+                .map(|(k, e)| ((*k).to_string(), e.clone()))
                 .collect(),
         }
     }
@@ -961,6 +974,87 @@ mod tests {
     }
 
     #[test]
+    fn entry_output_cases() {
+        let with = |output: Option<&str>| Entry {
+            output: output.map(String::from),
+            ..entry(8, 8, 480)
+        };
+        let cases = [
+            (
+                "with output",
+                r#"{"x":8,"y":8,"width":480,"output":"HDMI-A-1"}"#,
+                Some(with(Some("HDMI-A-1"))),
+            ),
+            (
+                "without output",
+                r#"{"x":8,"y":8,"width":480}"#,
+                Some(with(None)),
+            ),
+            (
+                "unknown field",
+                r#"{"x":8,"y":8,"width":480,"monitor":"DP-3"}"#,
+                None,
+            ),
+            (
+                "output not a string",
+                r#"{"x":8,"y":8,"width":480,"output":3}"#,
+                None,
+            ),
+        ];
+        for (name, text, want) in cases {
+            let got: Option<Entry> = serde_json::from_str(text).ok();
+            assert_eq!(got, want, "{name}");
+            if let Some(entry) = want {
+                let back = serde_json::to_string(&entry).unwrap();
+                assert_eq!(back, text, "{name} round trip");
+            }
+        }
+    }
+
+    #[test]
+    fn save_writes_output() {
+        let with_output = Entry {
+            output: Some("HDMI-A-1".to_string()),
+            ..entry(8, 8, 480)
+        };
+        let cases = [
+            (
+                "entry with output",
+                with_output,
+                "{\n  \"locked\": false,\n  \"snapping\": true,\n  \"user:1000001\": {\n    \"x\": 8,\n    \
+                 \"y\": 8,\n    \"width\": 480,\n    \"output\": \"HDMI-A-1\"\n  }\n}",
+            ),
+            (
+                "entry without output",
+                entry(8, 8, 480),
+                "{\n  \"locked\": false,\n  \"snapping\": true,\n  \"user:1000001\": {\n    \"x\": 8,\n    \
+                 \"y\": 8,\n    \"width\": 480\n  }\n}",
+            ),
+        ];
+        for (name, placed, want) in cases {
+            let tmp = TempDir::new("save-output");
+            let path = tmp.path().join("layout.json");
+            save(&path, &file(&[("user:1000001", placed)])).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn even_down_cases() {
+        let cases: [(&str, i64, i64); 5] = [
+            ("even", 480, 480),
+            ("odd", 481, 480),
+            ("zero", 0, 0),
+            ("negative odd", -3, -4),
+            ("negative even", -4, -4),
+        ];
+        for (name, value, want) in cases {
+            assert_eq!(even_down(value), want, "{name}");
+        }
+    }
+
+    #[test]
     fn apply_cases() {
         let both = [
             ("user:1000001", entry(8, 8, 480)),
@@ -970,7 +1064,7 @@ mod tests {
         let placed = entry(100, 200, 544);
         let moved = [
             ("user:1000001", entry(8, 8, 480)),
-            ("character:Pilot Two", placed),
+            ("character:Pilot Two", placed.clone()),
         ];
         let cases = [
             (
@@ -1004,7 +1098,7 @@ mod tests {
         ];
         for (name, start, user_placed, want, want_file) in cases {
             let mut f = file(start);
-            let got = key_change(&mut f, "character:Pilot Two", placed, user_placed);
+            let got = key_change(&mut f, "character:Pilot Two", placed.clone(), user_placed);
             assert_eq!(got, want, "{name}");
             assert_eq!(f, file(want_file), "{name}");
         }

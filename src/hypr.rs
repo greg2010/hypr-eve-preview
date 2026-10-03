@@ -3,7 +3,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde::de::Error as _;
 
-use crate::geometry::Rect;
+use crate::geometry::{Rect, Size};
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -14,7 +14,6 @@ pub struct Workspace {
 pub struct Client {
     #[serde(deserialize_with = "deserialize_address")]
     pub address: u64,
-    pub class: String,
     pub title: String,
     pub workspace: Workspace,
     pub pid: i32,
@@ -59,11 +58,14 @@ pub fn parse_clients(json: &str) -> Result<Vec<Client>, HyprError> {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Monitor {
     pub name: String,
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
     pub scale: f64,
     pub transform: u32,
     pub reserved: [u32; 4],
+    pub focused: bool,
 }
 
 /// Parses the event form of an address: 1 to 16 hex digits with no prefix.
@@ -94,33 +96,59 @@ pub fn parse_active_window(json: &str) -> Result<Option<u64>, HyprError> {
     parse_address(address).map(Some)
 }
 
-pub fn is_game_client(class: &str, title: &str) -> bool {
-    class == "steam_app_8500" && is_game_title(title)
-}
-
 impl Monitor {
-    /// The output's logical area minus the reserved edges, in logical px.
-    pub fn usable_area(&self) -> Rect {
+    /// The output's size in logical px: the mode divided by the scale and rounded, with width and
+    /// height swapped for an odd transform.
+    pub fn logical_size(&self) -> Size {
         let (width, height) = if self.transform % 2 == 1 {
             (self.height, self.width)
         } else {
             (self.width, self.height)
         };
         let logical = |px: u32| (f64::from(px) / self.scale).round() as u32;
+        Size {
+            width: logical(width),
+            height: logical(height),
+        }
+    }
+
+    /// The output's logical area minus the reserved edges, in logical px.
+    pub fn usable_area(&self) -> Rect {
+        let size = self.logical_size();
         let [left, top, right, bottom] = self.reserved;
         Rect {
             x: left,
             y: top,
-            width: logical(width).saturating_sub(left).saturating_sub(right),
-            height: logical(height).saturating_sub(top).saturating_sub(bottom),
+            width: size.width.saturating_sub(left).saturating_sub(right),
+            height: size.height.saturating_sub(top).saturating_sub(bottom),
         }
     }
 }
 
+/// The index of the first monitor whose logical rectangle contains the layout point. The left and
+/// top edges belong to a monitor, the right and bottom edges to its neighbour.
+pub fn monitor_at(monitors: &[Monitor], x: f64, y: f64) -> Option<usize> {
+    monitors.iter().position(|m| {
+        let size = m.logical_size();
+        x >= f64::from(m.x)
+            && x < f64::from(m.x) + f64::from(size.width)
+            && y >= f64::from(m.y)
+            && y < f64::from(m.y) + f64::from(size.height)
+    })
+}
+
 pub const GAME_TITLE_PREFIX: &str = "EVE - ";
+
+/// The command-line argument only the EVE launcher passes to a game client.
+pub const LAUNCHER_ARG: &str = "/LauncherData=";
 
 pub fn is_game_title(title: &str) -> bool {
     title == "EVE" || title.starts_with(GAME_TITLE_PREFIX)
+}
+
+/// Whether a window is a game client: a game title and an EVE launcher command line.
+pub fn is_game_client(title: &str, cmdline: &str) -> bool {
+    is_game_title(title) && cmdline.contains(LAUNCHER_ARG)
 }
 
 /// The slot of an `EVE<n>` workspace name, n in 1 to 12 in decimal with no leading zero.
@@ -248,18 +276,23 @@ mod tests {
 
     #[test]
     fn is_game_client_cases() {
+        let launched = format!("exefile.exe /ssoToken=x {LAUNCHER_ARG}abc /language=en");
+        let launched = launched.as_str();
         let cases = [
-            ("steam_app_8500", "EVE", true),
-            ("steam_app_8500", "EVE - Pilot One", true),
-            ("steam_app_8500", "EVE - ", true),
-            ("steam_app_8500", "EVE Launcher", false),
-            ("steam_app_8500", "", false),
-            ("steam_app_8500", "EVE -", false),
-            ("steam_app_8500", "eve", false),
-            ("kitty", "EVE", false),
+            ("EVE", launched, true),
+            ("EVE - Zentiv", launched, true),
+            ("EVE - Foo - Google Chrome", "chrome --new-window", false),
+            ("EVE Launcher", launched, false),
+            ("", launched, false),
+            ("eve - x", launched, false),
+            ("EVE - X", "exefile.exe /language=en", false),
         ];
-        for (class, title, want) in cases {
-            assert_eq!(is_game_client(class, title), want, "{class:?} {title:?}");
+        for (title, cmdline, want) in cases {
+            assert_eq!(
+                is_game_client(title, cmdline),
+                want,
+                "{title:?} {cmdline:?}"
+            );
         }
     }
 
@@ -322,6 +355,9 @@ mod tests {
     fn monitor(width: u32, height: u32, scale: f64, transform: u32, reserved: [u32; 4]) -> Monitor {
         Monitor {
             name: "DP-3".to_string(),
+            x: 0,
+            y: 0,
+            focused: true,
             width,
             height,
             scale,
@@ -338,6 +374,17 @@ mod tests {
                 DP3,
                 Some(vec![monitor(3840, 2160, 1.5, 0, [0, 34, 0, 0])]),
             ),
+            (
+                "position and focus",
+                r#"[{"name": "DP-3", "width": 1920, "height": 1080, "x": 2560, "y": -40,
+                    "reserved": [0, 0, 0, 0], "scale": 1.0, "transform": 0, "focused": false}]"#,
+                Some(vec![Monitor {
+                    x: 2560,
+                    y: -40,
+                    focused: false,
+                    ..monitor(1920, 1080, 1.0, 0, [0, 0, 0, 0])
+                }]),
+            ),
             ("empty array", "[]", Some(vec![])),
             ("object", "{}", None),
             ("not json", "not json", None),
@@ -348,6 +395,81 @@ mod tests {
                 (Err(HyprError::Json(_)), None) => {}
                 (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn logical_size_cases() {
+        let size = |width, height| Size { width, height };
+        let cases = [
+            (
+                "scale 1",
+                monitor(1920, 1080, 1.0, 0, [0; 4]),
+                size(1920, 1080),
+            ),
+            (
+                "scale 1.5",
+                monitor(3840, 2160, 1.5, 0, [0; 4]),
+                size(2560, 1440),
+            ),
+            (
+                "rounds",
+                monitor(1000, 1000, 1.5, 0, [0; 4]),
+                size(667, 667),
+            ),
+            (
+                "transform 1 swaps",
+                monitor(2160, 3840, 1.5, 1, [0; 4]),
+                size(2560, 1440),
+            ),
+            (
+                "transform 2 keeps",
+                monitor(3840, 2160, 1.5, 2, [0; 4]),
+                size(2560, 1440),
+            ),
+            (
+                "transform 3 swaps",
+                monitor(3840, 2160, 1.5, 3, [0; 4]),
+                size(1440, 2560),
+            ),
+        ];
+        for (name, m, want) in cases {
+            assert_eq!(m.logical_size(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn monitor_at_cases() {
+        let at = |x, y, mut m: Monitor| {
+            m.x = x;
+            m.y = y;
+            m
+        };
+        let left = at(0, 0, monitor(1920, 1080, 1.0, 0, [0; 4]));
+        let right = at(1920, 0, monitor(3840, 2160, 1.5, 0, [0; 4]));
+        let gap = at(5000, 0, monitor(1920, 1080, 1.0, 0, [0; 4]));
+        let pair = vec![left.clone(), right];
+        let split = [left, gap];
+        type Case<'a> = (&'a str, &'a [Monitor], (f64, f64), Option<usize>);
+        let cases: Vec<Case> = vec![
+            ("inside the left", &pair, (100.0, 100.0), Some(0)),
+            ("inside the right", &pair, (3000.0, 1000.0), Some(1)),
+            (
+                "shared edge belongs to the right",
+                &pair,
+                (1920.0, 500.0),
+                Some(1),
+            ),
+            ("last column of the left", &pair, (1919.5, 500.0), Some(0)),
+            ("right monitor's far edge", &pair, (4480.0, 500.0), None),
+            ("below the left", &pair, (100.0, 1080.0), None),
+            ("below both", &pair, (2000.0, 1500.0), None),
+            ("above", &pair, (100.0, -1.0), None),
+            ("gap", &split, (3000.0, 100.0), None),
+            ("empty list", &[], (0.0, 0.0), None),
+        ];
+        for (name, monitors, (x, y), want) in cases {
+            assert_eq!(monitor_at(monitors, x, y), want, "{name}");
         }
     }
 

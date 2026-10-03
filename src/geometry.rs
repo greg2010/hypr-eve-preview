@@ -13,12 +13,38 @@ pub struct Point {
     pub y: u32,
 }
 
+/// A margin pair that may be negative, which places a layer surface partly or wholly outside
+/// its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offset {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<Point> for Offset {
+    fn from(point: Point) -> Self {
+        Offset {
+            x: i32::try_from(point.x).unwrap_or(i32::MAX),
+            y: i32::try_from(point.y).unwrap_or(i32::MAX),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+impl Rect {
+    pub fn size(self) -> Size {
+        Size {
+            width: self.width,
+            height: self.height,
+        }
+    }
 }
 
 /// Thumbnail of the given width for a buffer, with the exact height rounded to the nearest
@@ -37,6 +63,46 @@ pub fn thumbnail_size(width: u32, buffer: Size) -> Size {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rect_size_cases() {
+        let cases = [
+            ("offset ignored", (10, 34, 2560, 1406), (2560, 1406)),
+            ("empty", (60, 60, 0, 0), (0, 0)),
+        ];
+        for (name, (x, y, width, height), (w, h)) in cases {
+            let rect = Rect {
+                x,
+                y,
+                width,
+                height,
+            };
+            assert_eq!(
+                rect.size(),
+                Size {
+                    width: w,
+                    height: h
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_from_point_cases() {
+        let cases = [
+            ("origin", (0, 0), (0, 0)),
+            ("inside", (12, 34), (12, 34)),
+            ("beyond i32", (u32::MAX, 5), (i32::MAX, 5)),
+        ];
+        for (name, (x, y), (want_x, want_y)) in cases {
+            let want = Offset {
+                x: want_x,
+                y: want_y,
+            };
+            assert_eq!(Offset::from(Point { x, y }), want, "{name}");
+        }
+    }
 
     #[test]
     fn thumbnail_size_cases() {

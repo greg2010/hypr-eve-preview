@@ -479,6 +479,22 @@ mod tests {
                 .concat(),
             ),
             (
+                "enter_without_leave_after_a_release_is_idle",
+                [
+                    drag(),
+                    vec![
+                        (
+                            release(),
+                            vec![Effect::DragEnd { address: A }, cursor(Cursor::Default)],
+                        ),
+                        (enter(A), vec![cursor(Cursor::Default)]),
+                        (press(A, BTN_LEFT, false), vec![]),
+                        (release(), vec![Effect::Click { address: A }]),
+                    ],
+                ]
+                .concat(),
+            ),
+            (
                 "release_sends_last_move",
                 [
                     drag(),
@@ -828,6 +844,18 @@ mod tests {
                 "after_leave",
                 false,
                 vec![press(A, BTN_LEFT, false), rel(5.0, 0.0), leave(A)],
+                None,
+            ),
+            (
+                "after_leave_from_press",
+                false,
+                vec![press(A, BTN_LEFT, false), leave(A)],
+                None,
+            ),
+            (
+                "after_leave_from_resize",
+                false,
+                vec![press(A, BTN_LEFT, true), rel(5.0, 0.0), leave(A)],
                 None,
             ),
             (

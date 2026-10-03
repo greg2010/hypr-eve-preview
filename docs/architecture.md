@@ -4,7 +4,7 @@ How the daemon works, by component, for a reader about to change it. The CLI fla
 
 ## Purpose and shape
 
-hypr-eve-preview shows a live thumbnail of every EVE Online client window on one Hyprland output, each on its own layer surface above all windows. A click switches the output to the client's workspace, a drag moves the thumbnail and, while snapping is on, snaps it to the usable area's edges and to other thumbnails, and the grip and the wheel resize it; position and width persist per account. A global lock freezes the arrangement, a base opacity applies to every thumbnail not under the pointer, and hide tears every thumbnail down until show. A tray item and a command form (the same binary, sending one line to the daemon's control socket) switch lock, hide and snapping and set the base opacity, and the tray can quit the daemon. The daemon is one process with one thread that runs one calloop event loop. It talks to the Wayland compositor (capture, surfaces, pointer), Hyprland's two IPC sockets (window events, queries, the workspace dispatch), the session bus (the tray) and files (config, layout file, log, control socket).
+hypr-eve-preview shows a live thumbnail of every EVE Online client window on any Hyprland monitor, each on its own layer surface above all windows. A click switches to the client's workspace, a drag moves the thumbnail, also onto another monitor, and, while snapping is on, snaps it to the edges of its monitor's usable area and to the other thumbnails there, and the grip and the wheel resize it; position, width and monitor persist per account. A global lock freezes the arrangement, a base opacity applies to every thumbnail not under the pointer, and hide tears every thumbnail down until show. A tray item and a command form (the same binary, sending one line to the daemon's control socket) switch lock, hide and snapping and set the base opacity, and the tray can quit the daemon. The daemon is one process with one thread that runs one calloop event loop. It talks to the Wayland compositor (capture, surfaces, pointer), Hyprland's two IPC sockets (window events, queries, the workspace dispatch), the session bus (the tray) and files (config, layout file, log, control socket).
 
 ## Components
 
@@ -16,7 +16,7 @@ hypr-eve-preview shows a live thumbnail of every EVE Online client window on one
 | `report` | The report line set and its text; `Reporter` | lines from `main` | stderr, log file | [runtime.md](runtime.md) |
 | `ipc` | Hyprland socket paths; the event socket and its line buffer; one-shot requests; event parsing | event bytes, request replies | `Event`s, reply text | [runtime.md](runtime.md) |
 | `hypr` | Hyprland JSON shapes; address, game-client, slot, usable-area and capture-handle rules | `j/*` replies, event-line addresses | clients, monitors, usable area (`geometry::Rect`), active address, capture handle | [runtime.md](runtime.md) |
-| `clients` | Tracked and pending clients, the thumbnail set, active address, ring owner, account keys | `Event`s, `j/clients` entries | `Change` list | [runtime.md](runtime.md) |
+| `clients` | Tracked and pending clients, skipped addresses, the thumbnail set, active address, ring owner, account keys | `Event`s, `j/clients` entries, process command lines | `Change` list | [runtime.md](runtime.md) |
 | `capture` | Per-client frame and buffer state machine; the teardown plan | frame, import, release, configure and timer inputs | `Action` list | [rendering.md](rendering.md) |
 | `dmabuf` | GBM device on the render node; modifier choice; dmabuf import | feedback, frame format and size | buffer objects, import params | [rendering.md](rendering.md) |
 | `chrome` | Label font; ring and label rasterizer | label, ring, opacity, scale | ARGB8888 pixels | [rendering.md](rendering.md) |
@@ -65,10 +65,10 @@ flowchart LR
 5. **Layout.** A missing file is empty. An unreadable or malformed file is renamed aside with a `layout-error` line and the layout starts empty; a failed rename exits 1; no resolvable default path: exit 1.
 6. **Hyprland sockets.** Paths from the environment (unset: exit 1). The event socket connects non-blocking (failure: exit 1); events from this point queue in it.
 7. **Control socket.** Probe, remove a stale file, bind non-blocking. A daemon that answers, or a probe, removal or bind error: exit 1.
-8. **Queries.** `j/monitors` gives the output's scale and usable area, `j/clients` the snapshot, `j/activewindow` the initial focus. Failure: exit 1.
+8. **Queries.** `j/monitors` gives every monitor (name, layout position, size, scale, transform, reserved edges, focus) and so the default monitor: the one `output` names, else the focused one. `j/clients` gives the snapshot, `j/activewindow` the initial focus. Failure, or no default monitor: exit 1.
 9. **`start` line.**
 10. **Event loop** built. Failure: exit 1.
-11. **Wayland.** Connect; read the default dmabuf feedback on a private queue and open the GBM device on the render node it names; bind the globals; build `App`; roundtrip; find the configured `wl_output`; insert the Wayland source. Any failure: exit 1. No surface exists yet: a thumbnail's layer surface is created at its client's first frame.
+11. **Wayland.** Connect; read the default dmabuf feedback on a private queue and open the GBM device on the render node it names; bind the globals; build `App`; roundtrip; find the default monitor's `wl_output`; insert the Wayland source. Any failure: exit 1. No surface exists yet: a thumbnail's layer surface is created at its client's first frame.
 12. **Signals.** SIGINT and SIGTERM become a loop source. Failure: exit 1.
 13. **Tray.** Blocking session-bus calls (`tray`). A failure before registration prints `tray-unavailable` and the daemon runs without a tray; a failed registration keeps the tray waiting for a watcher.
 14. **Snapshot.** Each game client of the snapshot is tracked and its capture starts.
@@ -98,7 +98,7 @@ A failure in startup steps 1-6 removes nothing; step 7 removes a stale socket fi
 1. Hyprland → `ipc`: event lines on the event socket.
 2. `ipc` → `clients`: `Event`.
 3. `clients` → `main`: a `Change` list.
-4. `main` → `ipc` → Hyprland: `j/clients` for a `Lookup`; `hypr` parses the reply into `hypr::Client` entries, which go to `clients` with the user id from the process command line.
+4. `main` → `ipc` → Hyprland: `j/clients` for a `Lookup`; `hypr` parses the reply into `hypr::Client` entries, which go to `clients`, which reads the process command line of each window with a game title.
 5. `main` → `layout`: an added client's account key, for its saved `Entry` or a place in the default row.
 6. `main` → `capture`, `chrome`, `report`: `Input::Start` or the teardown plan, chrome redraws, the client report lines.
 
@@ -155,7 +155,7 @@ Mechanism: [control.md](control.md).
 | `wl_compositor` | 1-6 (sctk) | surfaces, regions | `overlay`; `main` for the cursor surface |
 | `wl_subcompositor` | 1 (sctk) | chrome subsurface | `overlay` |
 | `wl_shm` | 1 (sctk) | chrome buffers (ARGB8888); cursor theme fallback | `overlay`; `main` for the cursor theme |
-| `zwlr_layer_shell_v1` | 1-4 (sctk) | one overlay-layer surface per thumbnail | `overlay` |
+| `zwlr_layer_shell_v1` | 1-4 (sctk) | one overlay-layer surface per thumbnail at rest, one per monitor its rectangle touches during a drag | `overlay` |
 | `wp_viewporter` | 1 | dmabuf and chrome scaled to the thumbnail size | `overlay` |
 | `wp_alpha_modifier_v1` | 1 | thumbnail opacity | `overlay` |
 | `hyprland_toplevel_export_manager_v1` | 1-2 | capture frames: `capture_toplevel` and, at shutdown, the manager's `destroy`, both version 1 | `main` |
@@ -163,7 +163,7 @@ Mechanism: [control.md](control.md).
 | `zwp_relative_pointer_manager_v1` | 1 (sctk), must be advertised | drag and resize offsets | `main` |
 | `wl_seat` | 1-10 (sctk; later seats 1-7) | the pointer capability | `main` |
 | `wp_cursor_shape_manager_v1` | 1-2 (sctk), optional | cursor shapes, else the xcursor theme over `wl_shm` | `main` |
-| `wl_output` | 1-4 (sctk; xdg-output 1-3 when present) | the configured output, found by name | `main` |
+| `wl_output` | 1-4 (sctk; xdg-output 1-3 when present) | one per monitor, found by its `j/monitors` name: the default monitor's at startup, a monitor's at each surface creation on it | `main` |
 | `wl_display.sync` | core | detects a capture request for a vanished window | `main` |
 
 **Hyprland IPC.** Both sockets live in the instance directory below.
@@ -194,7 +194,7 @@ Mechanism: [control.md](control.md).
 | Instance directory | `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/` | Hyprland's two sockets | `ipc` |
 | Control socket | `.hypr-eve-preview.sock` in the instance directory | listen for the command form's ten commands (`lock`, `unlock`, `hide`, `show`, `toggle-lock`, `toggle-hide`, `snap`, `unsnap`, `toggle-snap`, `opacity <N>`); unlinked at exit | `control` |
 | Font | `label.font_file`, else the file `fc-match` prints | read once | `chrome` |
-| Process command line | `/proc/<pid>/cmdline` of each game client | read once per client | `clients` |
+| Process command line | `/proc/<pid>/cmdline` of each window with a game title | read at most once each time a window with a game title appears (startup snapshot or `openwindow`) | `clients` |
 | Render node | the `/dev/dri/renderD*` node whose device number matches the feedback | read-write, GBM | `dmabuf` |
 | Cursor theme | `<dir>/<theme>/index.theme` and `<dir>/<theme>/cursors/<name>` for `$XCURSOR_THEME` (else `default`) and the themes it inherits; `<dir>` from `$XCURSOR_PATH`, else the XDG data and icon directories | read at a cursor name's first use, only without the cursor-shape global | `main` (sctk) |
 

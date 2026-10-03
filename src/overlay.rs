@@ -22,7 +22,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 
 use crate::config::MAX_OPACITY;
-use crate::geometry::{BYTES_PER_PIXEL, Point, Size};
+use crate::geometry::{BYTES_PER_PIXEL, Offset, Size};
 
 #[derive(Debug)]
 pub enum OverlayError {
@@ -60,8 +60,9 @@ pub struct Overlay {
     alpha: WpAlphaModifierSurfaceV1,
     pool: SlotPool,
     size: Size,
-    position: Point,
+    position: Offset,
     configured: bool,
+    attached: bool,
 }
 
 /// The bound globals `Overlay::new` reads.
@@ -82,7 +83,7 @@ impl Overlay {
     pub fn new<D>(
         qh: &QueueHandle<D>,
         globals: &Globals<'_>,
-        position: Point,
+        position: Offset,
         size: Size,
         factor: u32,
     ) -> Result<Overlay, OverlayError>
@@ -103,7 +104,7 @@ impl Overlay {
             Some(globals.output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-        layer.set_margin(position.y as i32, 0, 0, position.x as i32);
+        layer.set_margin(position.y, 0, 0, position.x);
         layer.set_exclusive_zone(0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(size.width, size.height);
@@ -135,6 +136,7 @@ impl Overlay {
             size,
             position,
             configured: false,
+            attached: false,
         })
     }
 
@@ -151,11 +153,16 @@ impl Overlay {
         self.configured
     }
 
+    /// Whether a frame buffer has been attached since creation.
+    pub fn has_buffer(&self) -> bool {
+        self.attached
+    }
+
     pub fn size(&self) -> Size {
         self.size
     }
 
-    pub fn position(&self) -> Point {
+    pub fn position(&self) -> Offset {
         self.position
     }
 
@@ -197,7 +204,7 @@ impl Overlay {
         buffer: &WlBuffer,
         buffer_size: Size,
         size: Size,
-        position: Point,
+        position: Offset,
         y_invert: bool,
     ) {
         let surface = self.layer.wl_surface();
@@ -217,13 +224,13 @@ impl Overlay {
             .set_destination(size.width as i32, size.height as i32);
         if size != self.size {
             self.layer.set_size(size.width, size.height);
-            self.layer
-                .set_margin(position.y as i32, 0, 0, position.x as i32);
+            self.layer.set_margin(position.y, 0, 0, position.x);
             self.size = size;
             self.position = position;
         }
         surface.damage_buffer(0, 0, buffer_size.width as i32, buffer_size.height as i32);
         surface.commit();
+        self.attached = true;
     }
 
     /// Attaches the on-screen buffer again with full damage. Sends no other state.
@@ -234,21 +241,20 @@ impl Overlay {
         surface.commit();
     }
 
-    /// Margins and a layer commit; attaches nothing.
-    pub fn move_to(&mut self, position: Point) {
-        self.layer
-            .set_margin(position.y as i32, 0, 0, position.x as i32);
+    /// Margins and a layer commit; attaches nothing. A negative margin places the surface partly
+    /// or wholly outside its output.
+    pub fn move_to(&mut self, position: Offset) {
+        self.layer.set_margin(position.y, 0, 0, position.x);
         self.position = position;
         self.layer.wl_surface().commit();
     }
 
     /// Layer size, viewport destination and margins in one layer commit; attaches nothing.
-    pub fn resize(&mut self, size: Size, position: Point) {
+    pub fn resize(&mut self, size: Size, position: Offset) {
         self.layer.set_size(size.width, size.height);
         self.viewport
             .set_destination(size.width as i32, size.height as i32);
-        self.layer
-            .set_margin(position.y as i32, 0, 0, position.x as i32);
+        self.layer.set_margin(position.y, 0, 0, position.x);
         self.size = size;
         self.position = position;
         self.layer.wl_surface().commit();

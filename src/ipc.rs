@@ -72,7 +72,6 @@ pub enum Event {
     OpenWindow {
         address: u64,
         workspace: String,
-        class: String,
         title: String,
     },
     CloseWindow {
@@ -109,10 +108,9 @@ pub fn parse_event(line: &str) -> Result<Option<Event>, IpcError> {
         "openwindow" => {
             let mut parts = data.splitn(4, ',');
             match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some(a), Some(workspace), Some(class), Some(title)) => Event::OpenWindow {
+                (Some(a), Some(workspace), Some(_), Some(title)) => Event::OpenWindow {
                     address: address(a)?,
                     workspace: workspace.to_string(),
-                    class: class.to_string(),
                     title: title.to_string(),
                 },
                 _ => return Err(bad()),
@@ -279,11 +277,10 @@ mod tests {
         String::from_utf8_lossy(&line).into_owned()
     }
 
-    fn open_window(workspace: &str, class: &str, title: &str) -> Event {
+    fn open_window(workspace: &str, title: &str) -> Event {
         Event::OpenWindow {
             address: A,
             workspace: workspace.to_string(),
-            class: class.to_string(),
             title: title.to_string(),
         }
     }
@@ -295,13 +292,13 @@ mod tests {
         let cases: Vec<Row> = vec![
             (
                 "openwindow",
-                "openwindow>>555512345678,EVE-new,steam_app_8500,EVE".into(),
-                Ok(Some(open_window("EVE-new", "steam_app_8500", "EVE"))),
+                "openwindow>>555512345678,EVE-new,kitty,EVE".into(),
+                Ok(Some(open_window("EVE-new", "EVE"))),
             ),
             (
                 "openwindow title with commas",
-                "openwindow>>555512345678,EVE2,steam_app_8500,EVE - A, B, C".into(),
-                Ok(Some(open_window("EVE2", "steam_app_8500", "EVE - A, B, C"))),
+                "openwindow>>555512345678,EVE2,kitty,EVE - A, B, C".into(),
+                Ok(Some(open_window("EVE2", "EVE - A, B, C"))),
             ),
             (
                 "closewindow",

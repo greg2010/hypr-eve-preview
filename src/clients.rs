@@ -4,8 +4,7 @@ use std::io;
 
 use crate::{hypr, ipc};
 
-const LAUNCHER_ARG: &[u8] = b"/LauncherData=";
-const LAUNCHER_PREFIX: &[u8] = b"eve-online:tranquility::";
+const LAUNCHER_PREFIX: &str = "eve-online:tranquility::";
 const REMOVED_MISSED: &str = "not listed by j/clients";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +25,6 @@ impl fmt::Display for AccountKey {
 /// Why no user id could be read. The texts name no part of the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountError {
-    Unreadable(io::ErrorKind),
     Missing,
     Base64,
     Text,
@@ -34,14 +32,12 @@ pub enum AccountError {
 
 impl fmt::Display for AccountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = hypr::LAUNCHER_ARG.trim_end_matches('=');
         match self {
-            AccountError::Unreadable(kind) => {
-                write!(f, "cannot read the process command line: {kind}")
-            }
-            AccountError::Missing => f.write_str("no /LauncherData argument"),
-            AccountError::Base64 => f.write_str("/LauncherData is not valid base64"),
+            AccountError::Missing => write!(f, "no {name} argument"),
+            AccountError::Base64 => write!(f, "{name} is not valid base64"),
             AccountError::Text => {
-                f.write_str("/LauncherData does not decode to eve-online:tranquility::<id>:")
+                write!(f, "{name} does not decode to {LAUNCHER_PREFIX}<id>:")
             }
         }
     }
@@ -88,15 +84,15 @@ fn decode_base64(text: &[u8]) -> Result<Vec<u8>, AccountError> {
     Ok(out)
 }
 
-/// Decodes the user id of the first `/LauncherData=` argument of a NUL-separated command line.
-pub fn user_id_from_cmdline(cmdline: &[u8]) -> Result<u64, AccountError> {
+/// Decodes the user id of the first launcher argument of a space-separated command line.
+pub fn user_id_from_cmdline(cmdline: &str) -> Result<u64, AccountError> {
     let value = cmdline
-        .split(|&b| b == 0)
-        .find_map(|arg| arg.strip_prefix(LAUNCHER_ARG))
+        .split(' ')
+        .find_map(|arg| arg.strip_prefix(hypr::LAUNCHER_ARG))
         .ok_or(AccountError::Missing)?;
-    let decoded = decode_base64(value)?;
+    let decoded = decode_base64(value.as_bytes())?;
     let digits = decoded
-        .strip_prefix(LAUNCHER_PREFIX)
+        .strip_prefix(LAUNCHER_PREFIX.as_bytes())
         .and_then(|rest| rest.strip_suffix(b":"))
         .filter(|d| (1..=20).contains(&d.len()) && d.iter().all(u8::is_ascii_digit))
         .ok_or(AccountError::Text)?;
@@ -106,15 +102,16 @@ pub fn user_id_from_cmdline(cmdline: &[u8]) -> Result<u64, AccountError> {
         .ok_or(AccountError::Text)
 }
 
-/// Reads `/proc/<pid>/cmdline` and nothing else under `/proc/<pid>`. A pid of 0 or below is
-/// `Unreadable(NotFound)` without touching the filesystem.
-pub fn read_user_id(pid: i32) -> Result<u64, AccountError> {
-    if pid <= 0 {
-        return Err(AccountError::Unreadable(io::ErrorKind::NotFound));
-    }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|e| AccountError::Unreadable(e.kind()))?;
-    user_id_from_cmdline(&cmdline)
+/// Raw `/proc/<pid>/cmdline` with NUL separators as spaces, so a trailing NUL is a trailing space.
+/// Bytes that are not UTF-8 become U+FFFD.
+fn cmdline_text(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).replace('\0', " ")
+}
+
+/// Reads `/proc/<pid>/cmdline` and nothing else under `/proc/<pid>`.
+pub fn read_cmdline(pid: u32) -> io::Result<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    Ok(cmdline_text(&raw))
 }
 
 pub fn character_name(title: &str) -> Option<&str> {
@@ -188,37 +185,90 @@ pub enum Change {
         address: Option<u64>,
         previous: Option<u64>,
     },
+    /// The client carries no usable user id and falls back to its character name.
+    Account {
+        address: u64,
+        error: String,
+    },
+    /// A game-titled window with a pid of 0 or below or an unreadable command line; not tracked.
+    Skipped {
+        address: u64,
+        pid: i32,
+        error: String,
+    },
 }
 
-#[derive(Debug)]
+/// Reads the command line of a process; `read_cmdline` in production.
+pub type CmdlineReader = Box<dyn Fn(u32) -> io::Result<String>>;
+
 pub struct Clients {
+    read_cmdline: CmdlineReader,
     tracked: BTreeMap<u64, Tracked>,
     // The value is true once the 100 ms retry has been used.
     pending: BTreeMap<u64, bool>,
     thumbnails: BTreeSet<u64>,
+    // Game-titled windows decided against, so a repeat add reads nothing.
+    skipped: BTreeSet<u64>,
     active: Option<u64>,
     ring: Option<u64>,
 }
 
 impl Clients {
-    pub fn new(active: Option<u64>) -> Clients {
+    pub fn new(active: Option<u64>, read_cmdline: CmdlineReader) -> Clients {
         Clients {
+            read_cmdline,
             tracked: BTreeMap::new(),
             pending: BTreeMap::new(),
             thumbnails: BTreeSet::new(),
+            skipped: BTreeSet::new(),
             active,
             ring: None,
         }
     }
 
-    /// Tracks a game-client entry. Any other entry changes nothing but drops its pending lookup.
-    pub fn add(&mut self, entry: &hypr::Client, user_id: Option<u64>) -> Vec<Change> {
+    /// Tracks a game-client entry. A title that is not a game title, an address already tracked
+    /// and an address already skipped change nothing but drop the pending lookup and read no
+    /// command line. A pid of 0 or below, or a command line that cannot be read, leaves the window
+    /// untracked and yields a `Skipped` change. A command line without the launcher argument
+    /// leaves it untracked silently. Both are remembered until the window closes.
+    pub fn add(&mut self, entry: &hypr::Client) -> Vec<Change> {
         self.pending.remove(&entry.address);
-        if !hypr::is_game_client(&entry.class, &entry.title)
+        if !hypr::is_game_title(&entry.title)
             || self.tracked.contains_key(&entry.address)
+            || self.skipped.contains(&entry.address)
         {
             return Vec::new();
         }
+        let read = match u32::try_from(entry.pid) {
+            Ok(pid) if pid > 0 => (self.read_cmdline)(pid),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "no pid")),
+        };
+        let cmdline = match read {
+            Ok(cmdline) => cmdline,
+            Err(err) => {
+                self.skipped.insert(entry.address);
+                return vec![Change::Skipped {
+                    address: entry.address,
+                    pid: entry.pid,
+                    error: err.to_string(),
+                }];
+            }
+        };
+        if !hypr::is_game_client(&entry.title, &cmdline) {
+            self.skipped.insert(entry.address);
+            return Vec::new();
+        }
+        let mut changes = Vec::new();
+        let user_id = match user_id_from_cmdline(&cmdline) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                changes.push(Change::Account {
+                    address: entry.address,
+                    error: err.to_string(),
+                });
+                None
+            }
+        };
         self.tracked.insert(
             entry.address,
             Tracked {
@@ -230,9 +280,10 @@ impl Clients {
                 character: character_name(&entry.title).map(str::to_string),
             },
         );
-        vec![Change::Added {
+        changes.push(Change::Added {
             address: entry.address,
-        }]
+        });
+        changes
     }
 
     /// First miss asks for the retry, the second removes the pending address.
@@ -255,22 +306,21 @@ impl Clients {
 
     pub fn apply(&mut self, event: &ipc::Event) -> Vec<Change> {
         match event {
-            ipc::Event::OpenWindow {
-                address,
-                class,
-                title,
-                ..
-            } => {
+            ipc::Event::OpenWindow { address, title, .. } => {
                 if self.tracked.contains_key(address)
                     || self.pending.contains_key(address)
-                    || !hypr::is_game_client(class, title)
+                    || self.skipped.contains(address)
+                    || !hypr::is_game_title(title)
                 {
                     return Vec::new();
                 }
                 self.pending.insert(*address, false);
                 vec![Change::Lookup { address: *address }]
             }
-            ipc::Event::CloseWindow { address } => self.remove(*address, "closed".to_string()),
+            ipc::Event::CloseWindow { address } => {
+                self.skipped.remove(address);
+                self.remove(*address, "closed".to_string())
+            }
             ipc::Event::WindowTitle { address, title } => self.retitle(*address, title),
             ipc::Event::MoveWindow { address, workspace } => {
                 let Some(tracked) = self.tracked.get_mut(address) else {
@@ -373,6 +423,9 @@ impl Clients {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hypr::LAUNCHER_ARG;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const FIXTURE: &str = include_str!("../testdata/hyprctl-clients.json");
 
@@ -383,29 +436,56 @@ mod tests {
     const E: u64 = 0xffff00000000;
     const X: u64 = 0x555500009999;
 
-    const GAME: &str = "steam_app_8500";
+    const PID_OK: i32 = 1000;
+    const PID_NO_ID: i32 = 2000;
+    const PID_BROWSER: i32 = 3000;
+    const PID_DENIED: i32 = 4000;
 
-    fn entry(address: u64, class: &str, workspace: &str, title: &str) -> hypr::Client {
+    fn fixture_cmdline(pid: u32) -> io::Result<String> {
+        match i32::try_from(pid) {
+            Ok(1000..=1002) => Ok(format!(
+                "exefile.exe /ssoToken=x {LAUNCHER_ARG}ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo= /language=en"
+            )),
+            Ok(PID_NO_ID) => Ok(format!("exefile.exe {LAUNCHER_ARG}@@@@")),
+            Ok(PID_BROWSER) => Ok("chrome --new-window".to_string()),
+            Ok(PID_DENIED) => Err(io::ErrorKind::PermissionDenied.into()),
+            _ => Err(io::ErrorKind::NotFound.into()),
+        }
+    }
+
+    type Calls = Rc<RefCell<Vec<u32>>>;
+
+    fn counting(calls: &Calls) -> CmdlineReader {
+        let calls = Rc::clone(calls);
+        Box::new(move |pid| {
+            calls.borrow_mut().push(pid);
+            fixture_cmdline(pid)
+        })
+    }
+
+    fn new_clients(active: Option<u64>) -> Clients {
+        Clients::new(active, Box::new(fixture_cmdline))
+    }
+
+    fn entry(address: u64, pid: i32, workspace: &str, title: &str) -> hypr::Client {
         hypr::Client {
             address,
-            class: class.to_string(),
             title: title.to_string(),
             workspace: hypr::Workspace {
                 name: workspace.to_string(),
             },
-            pid: 1000,
+            pid,
         }
     }
 
     fn game(address: u64, workspace: &str, title: &str) -> hypr::Client {
-        entry(address, GAME, workspace, title)
+        entry(address, PID_OK, workspace, title)
     }
 
-    fn open(address: u64, class: &str, workspace: &str, title: &str) -> ipc::Event {
+    fn open(address: u64, workspace: &str, title: &str) -> ipc::Event {
         ipc::Event::OpenWindow {
             address,
             workspace: workspace.to_string(),
-            class: class.to_string(),
             title: title.to_string(),
         }
     }
@@ -430,7 +510,7 @@ mod tests {
 
     enum Op {
         Apply(ipc::Event),
-        Add(hypr::Client, Option<u64>),
+        Add(hypr::Client),
         Missed(u64),
         Thumbnail(u64),
         Remove(u64, &'static str),
@@ -438,10 +518,10 @@ mod tests {
 
     type Script = Vec<(Op, Vec<Change>)>;
 
-    fn base(active: Option<u64>) -> Clients {
-        let mut clients = Clients::new(active);
-        clients.add(&game(A, "EVE2", "EVE - Pilot One"), Some(1000001));
-        clients.add(&game(B, "EVE3", "EVE"), None);
+    fn base(active: Option<u64>, reader: CmdlineReader) -> Clients {
+        let mut clients = Clients::new(active, reader);
+        clients.add(&game(A, "EVE2", "EVE - Pilot One"));
+        clients.add(&entry(B, PID_NO_ID, "EVE3", "EVE"));
         clients
     }
 
@@ -449,7 +529,7 @@ mod tests {
         for (i, (op, want)) in script.into_iter().enumerate() {
             let got = match op {
                 Op::Apply(event) => clients.apply(&event),
-                Op::Add(client, user_id) => clients.add(&client, user_id),
+                Op::Add(client) => clients.add(&client),
                 Op::Missed(address) => clients.lookup_missed(address),
                 Op::Thumbnail(address) => clients.thumbnail_created(address),
                 Op::Remove(address, reason) => clients.remove(address, reason.to_string()),
@@ -459,7 +539,7 @@ mod tests {
     }
 
     fn run(name: &str, active: Option<u64>, script: Script, want_ordered: Vec<u64>) {
-        let mut clients = base(active);
+        let mut clients = base(active, Box::new(fixture_cmdline));
         play(name, &mut clients, script);
         assert_eq!(clients.ordered(), want_ordered, "{name} ordered");
     }
@@ -487,140 +567,127 @@ mod tests {
                 pid: 1001,
                 title: "EVE - Pilot One".to_string(),
                 workspace: "EVE2".to_string(),
-                user_id: None,
+                user_id: Some(1000001),
                 character: Some("Pilot One".to_string()),
             }),
         )];
         for (name, json, want_changes, want_ordered, want_a) in cases {
             let all = hypr::parse_clients(json).unwrap();
-            let mut clients = Clients::new(None);
+            let calls = Calls::default();
+            let mut clients = Clients::new(None, counting(&calls));
             let mut changes = Vec::new();
-            for client in all
-                .iter()
-                .filter(|c| hypr::is_game_client(&c.class, &c.title))
-            {
-                changes.extend(clients.add(client, None));
+            for client in &all {
+                changes.extend(clients.add(client));
             }
+            assert_eq!(*calls.borrow(), vec![1001, 1002], "{name} reads");
             assert_eq!(changes, want_changes, "{name} changes");
             assert_eq!(clients.ordered(), want_ordered, "{name} ordered");
             assert_eq!(clients.get(A), want_a.as_ref(), "{name} A");
         }
     }
 
-    fn cmdline(launcher: &str) -> Vec<u8> {
-        format!("C:\\x\\exefile.exe\0/ssoToken=synthetic.token.value\0{launcher}\0/language=en\0")
-            .into_bytes()
+    fn cmdline(value: &str) -> String {
+        format!(
+            "C:\\x\\exefile.exe /ssoToken=synthetic.token.value {LAUNCHER_ARG}{value} /language=en "
+        )
     }
 
     #[test]
     fn user_id_cases() {
-        let cases: Vec<(&str, Vec<u8>, Result<u64, AccountError>)> = vec![
+        let cases: Vec<(&str, String, Result<u64, AccountError>)> = vec![
             (
                 "tranquility",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo="),
                 Ok(1000001),
             ),
             (
                 "no padding",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDE6"),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDE6"),
                 Ok(10000001),
             ),
             (
                 "two padding characters",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDAxOg=="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDAxOg=="),
                 Ok(100000001),
             ),
             (
                 "u64 maximum",
-                cmdline(
-                    "/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTg0NDY3NDQwNzM3MDk1NTE2MTU6",
-                ),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTg0NDY3NDQwNzM3MDk1NTE2MTU6"),
                 Ok(u64::MAX),
             ),
             (
                 "first argument wins",
-                b"/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo=\0/LauncherData=@@@@\0"
-                    .to_vec(),
+                format!(
+                    "{LAUNCHER_ARG}ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo= {LAUNCHER_ARG}@@@@ "
+                ),
                 Ok(1000001),
             ),
-            ("empty", Vec::new(), Err(AccountError::Missing)),
+            ("empty", String::new(), Err(AccountError::Missing)),
             (
                 "no launcher argument",
-                b"C:\\x\\exefile.exe\0/language=en\0".to_vec(),
+                "C:\\x\\exefile.exe /language=en ".to_string(),
                 Err(AccountError::Missing),
             ),
             (
                 "prefix inside another argument",
-                b"x/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo=\0".to_vec(),
+                format!("x{LAUNCHER_ARG}ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo= "),
                 Err(AccountError::Missing),
             ),
-            (
-                "bad alphabet",
-                cmdline("/LauncherData=@@@@"),
-                Err(AccountError::Base64),
-            ),
-            (
-                "empty value",
-                cmdline("/LauncherData="),
-                Err(AccountError::Base64),
-            ),
+            ("bad alphabet", cmdline("@@@@"), Err(AccountError::Base64)),
+            ("empty value", cmdline(""), Err(AccountError::Base64)),
             (
                 "missing padding",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo"),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo"),
                 Err(AccountError::Base64),
             ),
             (
                 "padding in the middle",
-                cmdline("/LauncherData=ZXZl=W9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo="),
+                cmdline("ZXZl=W9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTo="),
                 Err(AccountError::Base64),
             ),
             (
                 "padding at the start of the last group",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAw=A=="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAw=A=="),
                 Err(AccountError::Base64),
             ),
             (
                 "three padding characters",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwM==="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwM==="),
                 Err(AccountError::Base64),
             ),
             (
                 "wrong prefix",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTpzaW5ndWxhcml0eTo6MTAwMDAwMTo="),
+                cmdline("ZXZlLW9ubGluZTpzaW5ndWxhcml0eTo6MTAwMDAwMTo="),
                 Err(AccountError::Text),
             ),
             (
                 "twenty-one digits",
-                cmdline(
-                    "/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDAwMDAwMDAwMDAwMDAwOg==",
-                ),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMDAwMDAwMDAwMDAwMDAwOg=="),
                 Err(AccountError::Text),
             ),
             (
                 "twenty digits above u64",
-                cmdline(
-                    "/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6OTk5OTk5OTk5OTk5OTk5OTk5OTk6",
-                ),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6OTk5OTk5OTk5OTk5OTk5OTk5OTk6"),
                 Err(AccountError::Text),
             ),
             (
                 "no digits",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6Og=="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6Og=="),
                 Err(AccountError::Text),
             ),
             (
                 "non-digit id",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTBhOg=="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTBhOg=="),
                 Err(AccountError::Text),
             ),
             (
                 "no closing colon",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMQ=="),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMQ=="),
                 Err(AccountError::Text),
             ),
             (
                 "trailing text",
-                cmdline("/LauncherData=ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTp4"),
+                cmdline("ZXZlLW9ubGluZTp0cmFucXVpbGl0eTo6MTAwMDAwMTp4"),
                 Err(AccountError::Text),
             ),
         ];
@@ -630,32 +697,8 @@ mod tests {
     }
 
     #[test]
-    fn read_user_id_cases() {
-        let cases = [
-            (
-                "negative pid",
-                -1,
-                Err(AccountError::Unreadable(io::ErrorKind::NotFound)),
-            ),
-            (
-                "zero pid",
-                0,
-                Err(AccountError::Unreadable(io::ErrorKind::NotFound)),
-            ),
-        ];
-        for (name, pid, want) in cases {
-            assert_eq!(read_user_id(pid), want, "{name}");
-        }
-    }
-
-    #[test]
     fn account_error_display_cases() {
         let cases = [
-            (
-                "unreadable",
-                AccountError::Unreadable(io::ErrorKind::NotFound),
-                "cannot read the process command line: entity not found",
-            ),
             (
                 "missing",
                 AccountError::Missing,
@@ -677,56 +720,288 @@ mod tests {
         }
     }
 
+    fn skipped(address: u64, pid: i32, error: &str) -> Change {
+        Change::Skipped {
+            address,
+            pid,
+            error: error.to_string(),
+        }
+    }
+
+    #[test]
+    fn add_identity_cases() {
+        let cases = [
+            (
+                "launcher command line",
+                entry(C, PID_OK, "EVE-new", "EVE"),
+                vec![Change::Added { address: C }],
+                vec![1000],
+                vec![C],
+            ),
+            (
+                "command line without the launcher argument",
+                entry(C, PID_BROWSER, "EVE-new", "EVE"),
+                vec![],
+                vec![3000],
+                vec![],
+            ),
+            (
+                "undecodable launcher argument",
+                entry(C, PID_NO_ID, "EVE-new", "EVE"),
+                vec![
+                    Change::Account {
+                        address: C,
+                        error: "/LauncherData is not valid base64".to_string(),
+                    },
+                    Change::Added { address: C },
+                ],
+                vec![2000],
+                vec![C],
+            ),
+            (
+                "unreadable command line",
+                entry(C, PID_DENIED, "EVE-new", "EVE"),
+                vec![skipped(C, PID_DENIED, "permission denied")],
+                vec![4000],
+                vec![],
+            ),
+            (
+                "negative pid",
+                entry(C, -1, "EVE-new", "EVE"),
+                vec![skipped(C, -1, "no pid")],
+                vec![],
+                vec![],
+            ),
+            (
+                "zero pid",
+                entry(C, 0, "EVE-new", "EVE"),
+                vec![skipped(C, 0, "no pid")],
+                vec![],
+                vec![],
+            ),
+        ];
+        for (name, client, want, want_reads, want_ordered) in cases {
+            let calls = Calls::default();
+            let mut clients = Clients::new(None, counting(&calls));
+            assert_eq!(clients.add(&client), want, "{name}");
+            assert_eq!(*calls.borrow(), want_reads, "{name} reads");
+            assert_eq!(clients.ordered(), want_ordered, "{name} ordered");
+        }
+    }
+
+    #[test]
+    fn add_non_game_title_cases() {
+        let cases = [
+            ("launcher window", entry(C, PID_OK, "Games", "EVE Launcher")),
+            ("browser window", entry(C, PID_OK, "1", "Firefox")),
+        ];
+        for (name, client) in cases {
+            let calls = Calls::default();
+            let mut clients = base(None, counting(&calls));
+            assert_eq!(*calls.borrow(), vec![1000, 2000], "{name} seed reads");
+            assert_eq!(clients.add(&client), vec![], "{name}");
+            assert_eq!(*calls.borrow(), vec![1000, 2000], "{name} reads");
+            assert_eq!(clients.ordered(), vec![A, B], "{name} ordered");
+        }
+    }
+
+    #[test]
+    fn read_cases() {
+        use Op::*;
+        let lookup = vec![Change::Lookup { address: C }];
+        let close = || Apply(ipc::Event::CloseWindow { address: C });
+        let cases: Vec<(&str, Script, Vec<u32>, Vec<u64>)> = vec![
+            (
+                "openwindow then a game client",
+                vec![
+                    (Apply(open(C, "EVE-new", "EVE")), lookup.clone()),
+                    (
+                        Add(entry(C, PID_OK, "EVE-new", "EVE")),
+                        vec![Change::Added { address: C }],
+                    ),
+                ],
+                vec![1000],
+                vec![C],
+            ),
+            (
+                "openwindow then a browser",
+                vec![
+                    (Apply(open(C, "EVE-new", "EVE")), lookup.clone()),
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                ],
+                vec![3000],
+                vec![],
+            ),
+            (
+                "openwindow then an unreadable command line",
+                vec![
+                    (Apply(open(C, "EVE-new", "EVE")), lookup.clone()),
+                    (
+                        Add(entry(C, PID_DENIED, "EVE-new", "EVE")),
+                        vec![skipped(C, PID_DENIED, "permission denied")],
+                    ),
+                    (Missed(C), vec![]),
+                ],
+                vec![4000],
+                vec![],
+            ),
+            (
+                "openwindow of another title",
+                vec![
+                    (
+                        Add(game(A, "EVE2", "EVE - Pilot One")),
+                        vec![Change::Added { address: A }],
+                    ),
+                    (
+                        Add(entry(B, PID_NO_ID, "EVE3", "EVE")),
+                        vec![
+                            Change::Account {
+                                address: B,
+                                error: "/LauncherData is not valid base64".to_string(),
+                            },
+                            Change::Added { address: B },
+                        ],
+                    ),
+                    (Apply(open(C, "1", "Firefox")), vec![]),
+                ],
+                vec![1000, 2000],
+                vec![A, B],
+            ),
+            (
+                "unreadable entry then openwindow",
+                vec![
+                    (
+                        Add(entry(C, PID_DENIED, "EVE-new", "EVE")),
+                        vec![skipped(C, PID_DENIED, "permission denied")],
+                    ),
+                    (Apply(open(C, "EVE-new", "EVE")), vec![]),
+                    (Add(entry(C, PID_DENIED, "EVE-new", "EVE")), vec![]),
+                ],
+                vec![4000],
+                vec![],
+            ),
+            (
+                "browser entry then openwindow",
+                vec![
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                    (Apply(open(C, "EVE-new", "EVE")), vec![]),
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                ],
+                vec![3000],
+                vec![],
+            ),
+            (
+                "closewindow forgets an unreadable address",
+                vec![
+                    (
+                        Add(entry(C, PID_DENIED, "EVE-new", "EVE")),
+                        vec![skipped(C, PID_DENIED, "permission denied")],
+                    ),
+                    (close(), vec![]),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup.clone()),
+                    (
+                        Add(entry(C, PID_DENIED, "EVE-new", "EVE")),
+                        vec![skipped(C, PID_DENIED, "permission denied")],
+                    ),
+                ],
+                vec![4000, 4000],
+                vec![],
+            ),
+            (
+                "closewindow forgets a browser address",
+                vec![
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                    (close(), vec![]),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup),
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                ],
+                vec![3000, 3000],
+                vec![],
+            ),
+        ];
+        for (name, script, want_reads, want_ordered) in cases {
+            let calls = Calls::default();
+            let mut clients = Clients::new(None, counting(&calls));
+            play(name, &mut clients, script);
+            assert_eq!(*calls.borrow(), want_reads, "{name} reads");
+            assert_eq!(clients.ordered(), want_ordered, "{name} ordered");
+        }
+    }
+
+    #[test]
+    fn cmdline_text_cases() {
+        let cases: [(&str, &[u8], &str); 5] = [
+            ("empty", b"", ""),
+            ("separated arguments", b"a\0b\0c", "a b c"),
+            ("trailing NUL becomes a trailing space", b"a\0b\0", "a b "),
+            ("invalid UTF-8", b"a\xffb\0", "a\u{FFFD}b "),
+            ("no NUL", b"exefile.exe", "exefile.exe"),
+        ];
+        for (name, raw, want) in cases {
+            assert_eq!(cmdline_text(raw), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn launcher_command_line_from_the_wire() {
+        type Row<'a> = (&'a str, &'a [u8], bool, Result<u64, AccountError>);
+        let cases: [Row; 1] = [(
+            "launcher command line",
+            include_bytes!("../testdata/cmdline-launcher"),
+            true,
+            Ok(1000001),
+        )];
+        for (name, bytes, want_game, want_id) in cases {
+            let text = cmdline_text(bytes);
+            assert_eq!(hypr::is_game_client("EVE", &text), want_game, "{name} game");
+            assert_eq!(user_id_from_cmdline(&text), want_id, "{name} id");
+        }
+    }
+
     #[test]
     fn key_cases() {
-        type Row<'a> = (
-            &'a str,
-            Option<u64>,
-            Vec<&'a str>,
-            Option<AccountKey>,
-            &'a str,
-        );
+        type Row<'a> = (&'a str, i32, Vec<&'a str>, Option<AccountKey>, &'a str);
         let cases: Vec<Row> = vec![
             (
                 "user id",
-                Some(1000001),
+                PID_OK,
                 vec!["EVE - Pilot One"],
                 Some(AccountKey::User(1000001)),
                 "user:1000001",
             ),
             (
                 "user id wins over a name",
-                Some(1000001),
+                PID_OK,
                 vec!["EVE", "EVE - Pilot One"],
                 Some(AccountKey::User(1000001)),
                 "user:1000001",
             ),
             (
                 "character",
-                None,
+                PID_NO_ID,
                 vec!["EVE - Pilot One"],
                 Some(AccountKey::Character("Pilot One".to_string())),
                 "character:Pilot One",
             ),
             (
                 "character kept after a bare title",
-                None,
+                PID_NO_ID,
                 vec!["EVE - Pilot One", "EVE"],
                 Some(AccountKey::Character("Pilot One".to_string())),
                 "character:Pilot One",
             ),
             (
                 "character follows the latest name",
-                None,
+                PID_NO_ID,
                 vec!["EVE - Pilot One", "EVE - Pilot Two"],
                 Some(AccountKey::Character("Pilot Two".to_string())),
                 "character:Pilot Two",
             ),
-            ("bare title only", None, vec!["EVE"], None, ""),
+            ("bare title only", PID_NO_ID, vec!["EVE"], None, ""),
         ];
-        for (name, user_id, titles, want, text) in cases {
-            let mut clients = Clients::new(None);
-            clients.add(&game(B, "EVE3", titles[0]), user_id);
+        for (name, pid, titles, want, text) in cases {
+            let mut clients = new_clients(None);
+            clients.add(&entry(B, pid, "EVE3", titles[0]));
             for title in &titles[1..] {
                 clients.apply(&title_event(B, title));
             }
@@ -800,24 +1075,19 @@ mod tests {
             (
                 "openwindow of a new game client",
                 vec![(
-                    Apply(open(C, GAME, "EVE-new", "EVE")),
+                    Apply(open(C, "EVE-new", "EVE")),
                     vec![Change::Lookup { address: C }],
                 )],
                 vec![A, B],
             ),
             (
                 "openwindow of the launcher title",
-                vec![(Apply(open(C, GAME, "EVE-new", "EVE Launcher")), vec![])],
-                vec![A, B],
-            ),
-            (
-                "openwindow of another class",
-                vec![(Apply(open(C, "kitty", "1", "EVE")), vec![])],
+                vec![(Apply(open(C, "EVE-new", "EVE Launcher")), vec![])],
                 vec![A, B],
             ),
             (
                 "openwindow of a tracked address",
-                vec![(Apply(open(A, GAME, "EVE2", "EVE")), vec![])],
+                vec![(Apply(open(A, "EVE2", "EVE")), vec![])],
                 vec![A, B],
             ),
             (
@@ -944,7 +1214,7 @@ mod tests {
             (
                 "miss twice",
                 vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup(C)),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
                     (Missed(C), vec![Change::Retry { address: C }]),
                     (Missed(C), vec![removed(C, "not listed by j/clients")]),
                     (Missed(C), vec![]),
@@ -959,16 +1229,39 @@ mod tests {
             (
                 "second openwindow while pending",
                 vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup(C)),
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), vec![]),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
+                    (Apply(open(C, "EVE-new", "EVE")), vec![]),
                 ],
                 vec![A, B],
             ),
             (
                 "hit is the launcher",
                 vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup(C)),
-                    (Add(game(C, "Games", "EVE Launcher"), None), vec![]),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
+                    (Add(game(C, "Games", "EVE Launcher")), vec![]),
+                    (Apply(ipc::Event::CloseWindow { address: C }), vec![]),
+                    (Missed(C), vec![]),
+                ],
+                vec![A, B],
+            ),
+            (
+                "hit lacks the launcher argument",
+                vec![
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
+                    (Add(entry(C, PID_BROWSER, "EVE-new", "EVE")), vec![]),
+                    (Apply(ipc::Event::CloseWindow { address: C }), vec![]),
+                    (Missed(C), vec![]),
+                ],
+                vec![A, B],
+            ),
+            (
+                "hit cannot be read",
+                vec![
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
+                    (
+                        Add(entry(C, PID_DENIED, "EVE-new", "EVE")),
+                        vec![skipped(C, PID_DENIED, "permission denied")],
+                    ),
                     (Apply(ipc::Event::CloseWindow { address: C }), vec![]),
                     (Missed(C), vec![]),
                 ],
@@ -977,9 +1270,9 @@ mod tests {
             (
                 "hit is a game client",
                 vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup(C)),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
                     (
-                        Add(game(C, "EVE-new", "EVE"), Some(1000002)),
+                        Add(game(C, "EVE-new", "EVE")),
                         vec![Change::Added { address: C }],
                     ),
                 ],
@@ -988,10 +1281,10 @@ mod tests {
             (
                 "hit after a retry",
                 vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup(C)),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup(C)),
                     (Missed(C), vec![Change::Retry { address: C }]),
                     (
-                        Add(game(C, "EVE-new", "EVE"), None),
+                        Add(game(C, "EVE-new", "EVE")),
                         vec![Change::Added { address: C }],
                     ),
                     (Missed(C), vec![]),
@@ -1000,7 +1293,7 @@ mod tests {
             ),
             (
                 "add of a tracked address",
-                vec![(Add(game(A, "EVE5", "EVE"), None), vec![])],
+                vec![(Add(game(A, "EVE5", "EVE")), vec![])],
                 vec![A, B],
             ),
         ];
@@ -1053,12 +1346,12 @@ mod tests {
                 None,
                 vec![
                     (
-                        Apply(open(C, GAME, "EVE-new", "EVE")),
+                        Apply(open(C, "EVE-new", "EVE")),
                         vec![Change::Lookup { address: C }],
                     ),
                     (Apply(active(Some(C))), vec![]),
                     (
-                        Add(game(C, "EVE-new", "EVE"), None),
+                        Add(game(C, "EVE-new", "EVE")),
                         vec![Change::Added { address: C }],
                     ),
                     (Thumbnail(C), vec![owner(Some(C), None)]),
@@ -1094,7 +1387,7 @@ mod tests {
             ),
         ];
         for (name, initial, script, want_owner) in cases {
-            let mut clients = base(initial);
+            let mut clients = base(initial, Box::new(fixture_cmdline));
             play(name, &mut clients, script);
             assert_eq!(clients.ring_owner(), want_owner, "{name} ring owner");
         }
@@ -1107,25 +1400,25 @@ mod tests {
         let cases: Vec<(&str, Script, Vec<u64>)> = vec![
             (
                 "slots then no slot",
-                vec![(Add(game(C, "EVE-new", "EVE"), None), added(C))],
+                vec![(Add(game(C, "EVE-new", "EVE")), added(C))],
                 vec![A, B, C],
             ),
             (
                 "same slot by address",
-                vec![(Add(game(D, "EVE2", "EVE"), None), added(D))],
+                vec![(Add(game(D, "EVE2", "EVE")), added(D))],
                 vec![D, A, B],
             ),
             (
                 "no slot by address",
                 vec![
-                    (Add(game(C, "EVE-new", "EVE"), None), added(C)),
-                    (Add(game(D, "Games", "EVE"), None), added(D)),
+                    (Add(game(C, "EVE-new", "EVE")), added(C)),
+                    (Add(game(D, "Games", "EVE")), added(D)),
                 ],
                 vec![A, B, D, C],
             ),
             (
                 "slot beats address",
-                vec![(Add(game(E, "EVE1", "EVE"), None), added(E))],
+                vec![(Add(game(E, "EVE1", "EVE")), added(E))],
                 vec![E, A, B],
             ),
             (
@@ -1156,7 +1449,7 @@ mod tests {
     fn run_pending(cases: Vec<PendingCase>) {
         for case in cases {
             let name = case.name;
-            let mut clients = base(None);
+            let mut clients = base(None, Box::new(fixture_cmdline));
             play(name, &mut clients, case.script);
             assert_eq!(clients.ordered(), case.want_ordered, "{name} ordered");
             let pending: Vec<u64> = clients.pending.keys().copied().collect();
@@ -1180,7 +1473,7 @@ mod tests {
             PendingCase {
                 name: "pending address, non-game title",
                 script: vec![
-                    (Apply(open(C, GAME, "EVE-new", "EVE")), lookup),
+                    (Apply(open(C, "EVE-new", "EVE")), lookup),
                     (Apply(title_event(C, "EVE Launcher")), vec![]),
                 ],
                 want_ordered: vec![A, B],
@@ -1209,13 +1502,13 @@ mod tests {
         use Op::*;
         let open_c = || {
             (
-                Apply(open(C, GAME, "EVE-new", "EVE")),
+                Apply(open(C, "EVE-new", "EVE")),
                 vec![Change::Lookup { address: C }],
             )
         };
         let open_d = || {
             (
-                Apply(open(D, GAME, "EVE-new", "EVE")),
+                Apply(open(D, "EVE-new", "EVE")),
                 vec![Change::Lookup { address: D }],
             )
         };
@@ -1306,7 +1599,7 @@ mod tests {
                 "closewindow of a pending address",
                 vec![
                     (
-                        Apply(open(C, GAME, "EVE-new", "EVE")),
+                        Apply(open(C, "EVE-new", "EVE")),
                         vec![Change::Lookup { address: C }],
                     ),
                     (
@@ -1324,7 +1617,7 @@ mod tests {
                     (Apply(active(Some(A))), vec![owner(Some(A), None)]),
                     (Remove(A, "x"), vec![removed(A, "x"), owner(None, Some(A))]),
                     (
-                        Add(game(A, "EVE2", "EVE"), None),
+                        Add(game(A, "EVE2", "EVE")),
                         vec![Change::Added { address: A }],
                     ),
                     (Thumbnail(A), vec![owner(Some(A), None)]),

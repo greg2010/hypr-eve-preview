@@ -72,7 +72,8 @@ use chrome::{Chrome, Font};
 use clients::{Change, Clients};
 use config::Config;
 use dmabuf::{Allocator, DmaBuffer, DmabufError, FormatModifier};
-use geometry::{Point, Rect, Size, thumbnail_size};
+use geometry::{Offset, Point, Rect, Size, thumbnail_size};
+use hypr::Monitor;
 use input::{Cursor, Effect, GRIP_SIZE, Gestures, PointerInput};
 use ipc::EventSocket;
 use layout::{Entry, KeyChange, LayoutFile, SaveAction, SaveSchedule};
@@ -217,9 +218,72 @@ enum Origin {
     User,
 }
 
+/// The frame buffer last presented, which a surface that starts after it shows at its configure.
+#[derive(Debug, Clone, Copy)]
+struct Shown {
+    slot: usize,
+    y_invert: bool,
+}
+
+/// A layer surface of a dragged or moving thumbnail on a monitor other than the record's own.
+struct Traveller {
+    overlay: Overlay,
+    monitor: usize,
+    chromed: bool,
+}
+
+/// Which surfaces a record has. The home surface always exists on the record's monitor; the
+/// travellers are on other monitors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SurfaceState {
+    Home,
+    /// Travellers on these monitors, ascending.
+    Straddling(Vec<usize>),
+    /// The surface on `monitor` becomes the record's overlay at its first configure. The
+    /// travellers on `others` go with the home surface.
+    Landing {
+        monitor: usize,
+        others: Vec<usize>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SurfaceEvent {
+    /// The monitors other than home that the dragged rectangle touches, ascending.
+    Touch(Vec<usize>),
+    Configured(usize),
+    ReleaseHome,
+    /// The record lands on `monitor`: a drag ended there, or a key change moves a record that
+    /// has only its home surface.
+    ReleaseAt {
+        monitor: usize,
+        configured: bool,
+    },
+    TearDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceAction {
+    Create(usize),
+    Destroy(usize),
+    Present(usize),
+    Commit(usize),
+}
+
+/// Where and how large new travellers are created.
+struct Spawn {
+    origin: (i64, i64),
+    size: Size,
+    factor: u32,
+}
+
 struct ClientState {
     capture: Option<Capture>,
     overlay: Option<Overlay>,
+    travellers: Vec<Traveller>,
+    surface_state: SurfaceState,
+    monitor: usize,
+    shown: Option<Shown>,
     buffers: [Option<DmaBuffer>; SLOTS],
     frame: Option<Frame>,
     timer: Option<RegistrationToken>,
@@ -231,11 +295,55 @@ struct ClientState {
 }
 
 impl ClientState {
-    fn entry(&self) -> Entry {
+    fn entry(&self, output: &str) -> Entry {
         Entry {
             x: self.position.x,
             y: self.position.y,
             width: self.width,
+            output: Some(output.to_string()),
+        }
+    }
+
+    /// The home surface, then the travellers: each with its monitor and whether it has chrome.
+    fn surfaces(&self) -> impl Iterator<Item = (&Overlay, usize, bool)> {
+        let home = self
+            .overlay
+            .as_ref()
+            .map(|o| (o, self.monitor, self.chromed));
+        home.into_iter().chain(
+            self.travellers
+                .iter()
+                .map(|t| (&t.overlay, t.monitor, t.chromed)),
+        )
+    }
+
+    fn surfaces_mut(&mut self) -> impl Iterator<Item = (&mut Overlay, usize, &mut bool)> {
+        let home = self
+            .overlay
+            .as_mut()
+            .map(|o| (o, self.monitor, &mut self.chromed));
+        home.into_iter().chain(
+            self.travellers
+                .iter_mut()
+                .map(|t| (&mut t.overlay, t.monitor, &mut t.chromed)),
+        )
+    }
+
+    /// The surface on `monitor`: the home surface or a traveller.
+    fn surface_on(&mut self, monitor: usize) -> Option<&mut Overlay> {
+        if monitor == self.monitor {
+            self.overlay.as_mut()
+        } else {
+            self.travellers
+                .iter_mut()
+                .find(|t| t.monitor == monitor)
+                .map(|t| &mut t.overlay)
+        }
+    }
+
+    fn destroy_traveller(&mut self, monitor: usize) {
+        if let Some(at) = self.travellers.iter().position(|t| t.monitor == monitor) {
+            self.travellers.remove(at).overlay.destroy();
         }
     }
 }
@@ -244,7 +352,12 @@ impl ClientState {
 struct PressStart {
     address: u64,
     position: Point,
+    grab: (f64, f64),
     width: u32,
+    /// The monitor last under the pointer during a drag; the home monitor at the press.
+    monitor: usize,
+    /// The dragged rectangle's top-left in layout coordinates, from the first drag event.
+    at: Option<(i64, i64)>,
 }
 
 struct SeatPointer {
@@ -288,8 +401,8 @@ struct App {
     save_timer: Option<RegistrationToken>,
     config: Config,
     font: Font,
-    scale: f64,
-    usable: Size,
+    monitors: Vec<Monitor>,
+    default_monitor: usize,
     mode: DamageMode,
     reporter: Reporter,
     requests: PathBuf,
@@ -339,24 +452,6 @@ impl App {
         }
     }
 
-    /// The user id of a game client. A failure is reported and means no user id, and the account
-    /// key then falls back to the character name from the title.
-    fn game_user_id(&mut self, entry: &hypr::Client) -> Option<u64> {
-        if !hypr::is_game_client(&entry.class, &entry.title) {
-            return None;
-        }
-        match clients::read_user_id(entry.pid) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                self.emit(&Line::Account {
-                    address: entry.address,
-                    error: err.to_string(),
-                });
-                None
-            }
-        }
-    }
-
     fn feed(&mut self, address: u64, input: Input) {
         if self.stop.is_some() {
             return;
@@ -402,21 +497,19 @@ impl App {
                         _ => self.out_of_step("copy"),
                     }
                 }
-                Action::Recommit { slot, buffer_size } => {
-                    let record = self.records.get_mut(&address);
-                    match record {
-                        Some(ClientState {
-                            overlay: Some(overlay),
-                            buffers,
-                            ..
-                        }) if buffers[slot].is_some() => {
-                            if let Some(buffer) = buffers[slot].as_ref() {
-                                overlay.recommit(&buffer.wl_buffer, buffer_size);
+                Action::Recommit { slot, buffer_size } => match self.records.get_mut(&address) {
+                    Some(record) if record.buffers[slot].is_some() => {
+                        let buffer = record.buffers[slot].as_ref().map(|b| b.wl_buffer.clone());
+                        if let Some(buffer) = buffer {
+                            for (overlay, _, _) in record.surfaces_mut() {
+                                if overlay.has_buffer() {
+                                    overlay.recommit(&buffer, buffer_size);
+                                }
                             }
                         }
-                        _ => self.out_of_step("recommit"),
                     }
-                }
+                    _ => self.out_of_step("recommit"),
+                },
                 Action::Present {
                     slot,
                     buffer_size,
@@ -443,12 +536,56 @@ impl App {
         self.stop(failure(out_of_step_reason(action)));
     }
 
-    fn output(&self) -> Option<WlOutput> {
-        self.output_state.outputs().find(|o| {
-            self.output_state
-                .info(o)
-                .is_some_and(|i| i.name.as_deref() == Some(self.config.output.as_str()))
-        })
+    fn wl_output(&self, name: &str) -> Result<WlOutput, SetupError> {
+        self.output_state
+            .outputs()
+            .find(|o| {
+                self.output_state
+                    .info(o)
+                    .is_some_and(|i| i.name.as_deref() == Some(name))
+            })
+            .ok_or_else(|| SetupError::NoOutput(name.to_string()))
+    }
+
+    fn globals<'a>(&'a self, output: &'a WlOutput) -> overlay::Globals<'a> {
+        overlay::Globals {
+            compositor: &self.compositor,
+            subcompositor: &self.subcompositor,
+            layer_shell: &self.layer_shell,
+            viewporter: &self.viewporter,
+            shm: &self.shm,
+            output,
+            alpha: &self.alpha,
+        }
+    }
+
+    fn usable(&self, monitor: usize) -> Size {
+        self.monitors[monitor].usable_area().size()
+    }
+
+    /// A new layer surface on `monitor`. A failure stops the daemon and returns `None`.
+    fn new_overlay(
+        &mut self,
+        monitor: usize,
+        position: Offset,
+        size: Size,
+        factor: u32,
+    ) -> Option<Overlay> {
+        let output = match self.wl_output(&self.monitors[monitor].name) {
+            Ok(output) => output,
+            Err(e) => {
+                self.stop(failure(e));
+                return None;
+            }
+        };
+        let globals = self.globals(&output);
+        match Overlay::new(&self.qh, &globals, position, size, factor) {
+            Ok(overlay) => Some(overlay),
+            Err(e) => {
+                self.stop(failure(e));
+                None
+            }
+        }
     }
 
     fn request_frame(&mut self, address: u64) {
@@ -471,37 +608,29 @@ impl App {
     }
 
     fn create_overlay(&mut self, address: u64, buffer_size: Size) {
-        let Some(output) = self.output() else {
-            self.stop(failure(SetupError::NoOutput(self.config.output.clone())));
+        let Some((width, monitor)) = self.records.get(&address).map(|r| (r.width, r.monitor))
+        else {
             return;
         };
-        let Some(width) = self.records.get(&address).map(|r| r.width) else {
-            return;
-        };
+        let width = capped_width(
+            i64::from(width),
+            &self.config.thumbnail,
+            self.usable(monitor),
+        );
         let size = thumbnail_size(width, buffer_size);
         let position = self.position_for(address, size);
         let factor = alpha_factor(self.effective_opacity(address));
-        let globals = overlay::Globals {
-            compositor: &self.compositor,
-            subcompositor: &self.subcompositor,
-            layer_shell: &self.layer_shell,
-            viewporter: &self.viewporter,
-            shm: &self.shm,
-            output: &output,
-            alpha: &self.alpha,
+        let Some(overlay) = self.new_overlay(monitor, Offset::from(position), size, factor) else {
+            return;
         };
-        match Overlay::new(&self.qh, &globals, position, size, factor) {
-            Ok(overlay) => {
-                if let Some(record) = self.records.get_mut(&address) {
-                    record.overlay = Some(overlay);
-                    record.buffer_size = Some(buffer_size);
-                    record.position = position;
-                }
-                let changes = self.clients.thumbnail_created(address);
-                self.apply_changes(changes);
-            }
-            Err(e) => self.stop(failure(e)),
+        if let Some(record) = self.records.get_mut(&address) {
+            record.overlay = Some(overlay);
+            record.buffer_size = Some(buffer_size);
+            record.position = position;
+            record.width = width;
         }
+        let changes = self.clients.thumbnail_created(address);
+        self.apply_changes(changes);
     }
 
     fn base_opacity(&self) -> u32 {
@@ -573,55 +702,83 @@ impl App {
             return;
         };
         let size = thumbnail_size(record.width, buffer_size);
-        let redraw = !record.chromed || record.overlay.as_ref().is_some_and(|o| o.size() != size);
-        let position = self.position_for(address, size);
-        if redraw && !self.draw_chrome(address, size) {
+        let redraw = record
+            .surfaces()
+            .any(|(overlay, _, chromed)| !chromed || overlay.size() != size);
+        let home_position = self.position_for(address, size);
+        let pinned = self.pinned(address);
+        if redraw && !self.draw_chrome(address, size, None) {
             return;
         }
         let Some(record) = self.records.get_mut(&address) else {
             return;
         };
         record.buffer_size = Some(buffer_size);
-        if let (Some(overlay), Some(buffer)) =
-            (record.overlay.as_mut(), record.buffers[slot].as_ref())
-        {
-            overlay.present(&buffer.wl_buffer, buffer_size, size, position, y_invert);
-            record.position = overlay.position();
+        record.shown = Some(Shown { slot, y_invert });
+        let Some(buffer) = record.buffers[slot].as_ref().map(|b| b.wl_buffer.clone()) else {
+            return;
+        };
+        if let Some(home) = record.overlay.as_mut() {
+            let at = if pinned {
+                home.position()
+            } else {
+                Offset::from(home_position)
+            };
+            home.present(&buffer, buffer_size, size, at, y_invert);
+            if !pinned {
+                record.position = point_of(home.position());
+            }
+        }
+        for traveller in &mut record.travellers {
+            let overlay = &mut traveller.overlay;
+            if overlay.is_configured() {
+                let at = overlay.position();
+                overlay.present(&buffer, buffer_size, size, at, y_invert);
+            }
         }
     }
 
-    fn draw_chrome(&mut self, address: u64, logical: Size) -> bool {
+    /// Draws the chrome on every surface of the record, or only the one on `only`, each at its
+    /// monitor's scale. Returns false after stopping on an error.
+    fn draw_chrome(&mut self, address: u64, logical: Size, only: Option<usize>) -> bool {
         let Some(label) = self.clients.get(address).map(|t| t.label()) else {
             return true;
         };
         let border = &self.config.border;
         let ring = (self.clients.ring_owner() == Some(address) && border.width > 0)
             .then_some((border.width, border.color));
-        let buffer = chrome::buffer_size(logical, self.scale);
         let opacity = self.effective_opacity(address);
         let Some(record) = self.records.get_mut(&address) else {
             return true;
         };
-        let Some(overlay) = record.overlay.as_mut() else {
-            return true;
-        };
-        let chrome = Chrome {
-            ring,
-            label: &label,
-            style: &self.config.label,
-            scale: self.scale,
-            opacity,
-        };
-        let font = &self.font;
-        let result = overlay.draw_chrome(logical, buffer, |canvas, size| {
-            chrome::render(canvas, size, &chrome, font);
-        });
-        match result {
-            Ok(()) => {
-                record.chromed = true;
-                true
+        let mut failed = None;
+        for (overlay, monitor, chromed) in record.surfaces_mut() {
+            if only.is_some_and(|m| m != monitor) {
+                continue;
             }
-            Err(e) => {
+            let scale = self.monitors[monitor].scale;
+            let chrome = Chrome {
+                ring,
+                label: &label,
+                style: &self.config.label,
+                scale,
+                opacity,
+            };
+            let font = &self.font;
+            let buffer = chrome::buffer_size(logical, scale);
+            match overlay.draw_chrome(logical, buffer, |canvas, size| {
+                chrome::render(canvas, size, &chrome, font);
+            }) {
+                Ok(()) => *chromed = true,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        match failed {
+            None => true,
+            Some(e) => {
                 self.stop(failure(e));
                 false
             }
@@ -638,15 +795,15 @@ impl App {
         else {
             return;
         };
-        if !self.draw_chrome(address, size) {
+        if !self.draw_chrome(address, size, None) {
             return;
         }
-        if let Some(overlay) = self
-            .records
-            .get_mut(&address)
-            .and_then(|r| r.overlay.as_mut())
-        {
-            overlay.commit();
+        if let Some(record) = self.records.get_mut(&address) {
+            for (overlay, _, _) in record.surfaces_mut() {
+                if overlay.is_configured() {
+                    overlay.commit();
+                }
+            }
         }
     }
 
@@ -737,7 +894,7 @@ impl App {
         let Some(key) = self.clients.get(address).and_then(|t| t.key()) else {
             return;
         };
-        let entry = record.entry();
+        let entry = record.entry(&self.monitors[record.monitor].name);
         self.layout.entries.insert(key.to_string(), entry);
         self.request_save();
     }
@@ -752,6 +909,18 @@ impl App {
                 Change::Retry { address } => self.arm_retry(address),
                 Change::Added { address } => self.add_client(address),
                 Change::Removed { address, reason } => self.remove_client(address, reason),
+                Change::Account { address, error } => {
+                    self.emit(&Line::Account { address, error });
+                }
+                Change::Skipped {
+                    address,
+                    pid,
+                    error,
+                } => self.emit(&Line::WindowSkipped {
+                    address,
+                    pid,
+                    error,
+                }),
                 Change::Title {
                     address,
                     label_changed,
@@ -786,10 +955,7 @@ impl App {
             }
         };
         let changes = match entries.iter().find(|c| c.address == address) {
-            Some(entry) => {
-                let user_id = self.game_user_id(entry);
-                self.clients.add(entry, user_id)
-            }
+            Some(entry) => self.clients.add(entry),
             None => self.clients.lookup_missed(address),
         };
         self.apply_changes(changes);
@@ -808,20 +974,33 @@ impl App {
             account: account.as_ref().map(ToString::to_string),
             label: tracked.label(),
         };
-        let saved = account.and_then(|k| self.layout.entries.get(&k.to_string()).copied());
+        let saved = account.and_then(|k| self.layout.entries.get(&k.to_string()).cloned());
         let configured = &self.config.thumbnail;
-        let (origin, width, position) = match saved {
-            Some(entry) => (
-                Origin::Saved,
-                layout::effective_width(entry.width, configured, self.usable),
-                Point {
-                    x: entry.x,
-                    y: entry.y,
-                },
-            ),
+        let (origin, monitor, width, position) = match saved {
+            Some(entry) => {
+                let monitor = monitor_for(
+                    &self.monitors,
+                    entry.output.as_deref(),
+                    self.default_monitor,
+                );
+                (
+                    Origin::Saved,
+                    monitor,
+                    layout::effective_width(entry.width, configured, self.usable(monitor)),
+                    Point {
+                        x: entry.x,
+                        y: entry.y,
+                    },
+                )
+            }
             None => (
                 Origin::Default,
-                layout::effective_width(configured.width, configured, self.usable),
+                self.default_monitor,
+                layout::effective_width(
+                    configured.width,
+                    configured,
+                    self.usable(self.default_monitor),
+                ),
                 Point { x: 0, y: 0 },
             ),
         };
@@ -832,6 +1011,10 @@ impl App {
             ClientState {
                 capture,
                 overlay: None,
+                travellers: Vec::new(),
+                surface_state: SurfaceState::Home,
+                monitor,
+                shown: None,
                 buffers: Default::default(),
                 frame: None,
                 timer: None,
@@ -893,6 +1076,14 @@ impl App {
                     }
                 }
                 Teardown::DestroyOverlay => {
+                    let (next, actions) =
+                        surface_step(&record.surface_state, SurfaceEvent::TearDown);
+                    record.surface_state = next;
+                    for action in actions {
+                        if let SurfaceAction::Destroy(monitor) = action {
+                            record.destroy_traveller(monitor);
+                        }
+                    }
                     if let Some(overlay) = record.overlay.take() {
                         overlay.destroy();
                     }
@@ -917,6 +1108,7 @@ impl App {
             self.tear_down(address, &mut record);
             record.capture = None;
             record.buffer_size = None;
+            record.shown = None;
             record.chromed = false;
             self.records.insert(address, record);
         }
@@ -987,13 +1179,7 @@ impl App {
                 .collect();
             for address in addresses {
                 let factor = alpha_factor(self.effective_opacity(address));
-                if let Some(overlay) = self
-                    .records
-                    .get_mut(&address)
-                    .and_then(|r| r.overlay.as_mut())
-                {
-                    overlay.set_alpha(factor);
-                }
+                self.set_alpha(address, factor);
                 self.rerender_chrome(address);
             }
             self.emit(&Line::Opacity {
@@ -1057,7 +1243,7 @@ impl App {
         let Some(record) = self.records.get(&address) else {
             return;
         };
-        let current = record.entry();
+        let current = record.entry(&self.monitors[record.monitor].name);
         let user_placed = record.origin == Origin::User;
         match layout::key_change(&mut self.layout, &key.to_string(), current, user_placed) {
             KeyChange::Saved => self.request_save(),
@@ -1065,8 +1251,10 @@ impl App {
                 if let Some(record) = self.records.get_mut(&address) {
                     record.origin = Origin::Saved;
                 }
-                self.set_geometry(
+                let target = self.key_target(address, entry.output.as_deref());
+                self.relocate(
                     address,
+                    target,
                     i64::from(entry.width),
                     Some((i64::from(entry.x), i64::from(entry.y))),
                 );
@@ -1076,9 +1264,104 @@ impl App {
                 if let Some(record) = self.records.get_mut(&address) {
                     record.origin = Origin::Default;
                 }
-                self.set_geometry(address, i64::from(self.config.thumbnail.width), None);
+                let target = self.key_target(address, None);
+                self.relocate(
+                    address,
+                    target,
+                    i64::from(self.config.thumbnail.width),
+                    None,
+                );
                 self.recompute_placement();
             }
+        }
+    }
+
+    fn key_target(&self, address: u64, output: Option<&str>) -> Option<usize> {
+        let record = self.records.get(&address)?;
+        let trigger = Trigger::KeyChange {
+            output,
+            busy: self.pinned(address),
+        };
+        relocation(
+            trigger,
+            &self.monitors,
+            record.origin,
+            record.monitor,
+            self.default_monitor,
+        )
+    }
+
+    /// Applies a geometry request. With a `target` a surface there takes over at its first
+    /// configure; `None` keeps the monitor.
+    fn relocate(
+        &mut self,
+        address: u64,
+        target: Option<usize>,
+        requested: i64,
+        desired: Option<(i64, i64)>,
+    ) {
+        let Some(monitor) = target else {
+            self.set_geometry(address, requested, desired);
+            return;
+        };
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let Some(buffer_size) = record.buffer_size.filter(|_| record.overlay.is_some()) else {
+            record.monitor = monitor;
+            self.set_geometry(address, requested, desired);
+            return;
+        };
+        let usable = self.usable(monitor);
+        let (x, y) = desired.unwrap_or_else(|| self.row_slot(address));
+        let (width, size, position) = fitted(
+            requested,
+            &self.config.thumbnail,
+            buffer_size,
+            usable,
+            (x, y),
+        );
+        let spawn = Spawn {
+            origin: layout_point(position, &self.monitors[monitor]),
+            size,
+            factor: alpha_factor(self.effective_opacity(address)),
+        };
+        if let Some(record) = self.records.get_mut(&address) {
+            record.width = width;
+        }
+        let event = SurfaceEvent::ReleaseAt {
+            monitor,
+            configured: false,
+        };
+        self.step_surfaces(address, event, Some(spawn));
+    }
+
+    /// What follows a drop or a commit: a default-placed or saved record off the monitor it
+    /// belongs on starts its move there, a saved record applies its entry's geometry, a
+    /// user-placed record is saved.
+    fn settle(&mut self, address: u64) {
+        let Some(record) = self.records.get(&address) else {
+            return;
+        };
+        let entry = (record.origin == Origin::Saved)
+            .then(|| {
+                let key = self.clients.get(address)?.key()?;
+                self.layout.entries.get(&key.to_string()).cloned()
+            })
+            .flatten();
+        let target = relocation(
+            Trigger::Settled {
+                entry: entry.as_ref().map(|e| e.output.as_deref()),
+            },
+            &self.monitors,
+            record.origin,
+            record.monitor,
+            self.default_monitor,
+        );
+        match settled(target, record.origin, entry.as_ref(), record.width) {
+            Settle::Relocate { target, width, at } => self.relocate(address, target, width, at),
+            Settle::Save => self.layout_update(address),
+            Settle::Stay => {}
         }
     }
 
@@ -1094,21 +1377,25 @@ impl App {
             .collect()
     }
 
+    fn row_slot(&self, address: u64) -> (i64, i64) {
+        let index = self
+            .default_order()
+            .iter()
+            .position(|a| *a == address)
+            .unwrap_or(0);
+        self.default_slot(index)
+    }
+
     fn position_for(&self, address: u64, size: Size) -> Point {
         let Some(record) = self.records.get(&address) else {
             return Point { x: 0, y: 0 };
         };
         let (x, y) = if follows_row(record.origin, self.gestures.active(), address) {
-            let index = self
-                .default_order()
-                .iter()
-                .position(|a| *a == address)
-                .unwrap_or(0);
-            self.default_slot(index)
+            self.row_slot(address)
         } else {
             (i64::from(record.position.x), i64::from(record.position.y))
         };
-        layout::clamp_position(x, y, size, self.usable)
+        layout::clamp_position(x, y, size, self.usable(record.monitor))
     }
 
     fn default_slot(&self, index: usize) -> (i64, i64) {
@@ -1122,8 +1409,29 @@ impl App {
         }
     }
 
+    /// Whether a drag of the record has produced a rectangle and not yet ended.
+    fn dragging(&self, address: u64) -> bool {
+        self.press
+            .is_some_and(|p| p.address == address && p.at.is_some())
+    }
+
+    /// Whether the record's surfaces, not `position`, say where it is: a drag is in progress or
+    /// a surface on another monitor exists.
+    fn pinned(&self, address: u64) -> bool {
+        self.dragging(address)
+            || self
+                .records
+                .get(&address)
+                .is_some_and(|r| r.surface_state != SurfaceState::Home)
+    }
+
     fn move_clamped(&mut self, address: u64, x: i64, y: i64) {
-        let usable = self.usable;
+        if self.pinned(address) {
+            return;
+        }
+        let Some(usable) = self.records.get(&address).map(|r| self.usable(r.monitor)) else {
+            return;
+        };
         let Some(record) = self.records.get_mut(&address) else {
             return;
         };
@@ -1132,47 +1440,70 @@ impl App {
         };
         let position = layout::clamp_position(x, y, overlay.size(), usable);
         if position != record.position {
-            overlay.move_to(position);
+            overlay.move_to(Offset::from(position));
             record.position = position;
         }
     }
 
+    /// Gives every surface `size`, with the chrome redrawn at each monitor's scale when any
+    /// surface changes size. The home surface also moves to `home_at` when given. Other
+    /// surfaces keep their margins.
+    fn apply_geometry(&mut self, address: u64, size: Size, home_at: Option<Offset>) {
+        let Some(record) = self.records.get(&address) else {
+            return;
+        };
+        let resized = record
+            .surfaces()
+            .any(|(overlay, _, _)| overlay.size() != size);
+        if resized && !self.draw_chrome(address, size, None) {
+            return;
+        }
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let home = record.monitor;
+        for (overlay, monitor, _) in record.surfaces_mut() {
+            let at = match home_at {
+                Some(at) if monitor == home => at,
+                _ => overlay.position(),
+            };
+            if resized {
+                overlay.resize(size, at);
+            } else if at != overlay.position() {
+                overlay.move_to(at);
+            }
+        }
+        if let Some(at) = home_at {
+            record.position = point_of(at);
+        }
+    }
+
     fn set_geometry(&mut self, address: u64, requested: i64, desired: Option<(i64, i64)>) {
-        let clamped = u32::try_from(requested.max(0)).unwrap_or(u32::MAX);
-        let width = layout::effective_width(clamped, &self.config.thumbnail, self.usable);
-        let usable = self.usable;
+        let Some(usable) = self
+            .records
+            .get(&address)
+            .map(|r| self.usable(bound_monitor(&r.surface_state, r.monitor)))
+        else {
+            return;
+        };
+        let pinned = self.pinned(address);
+        let thumbnail = &self.config.thumbnail;
         let Some(record) = self.records.get_mut(&address) else {
             return;
         };
         let (x, y) =
             desired.unwrap_or((i64::from(record.position.x), i64::from(record.position.y)));
-        record.width = width;
-        let (Some(buffer_size), Some(overlay)) = (record.buffer_size, record.overlay.as_ref())
-        else {
+        let Some(buffer_size) = record.buffer_size.filter(|_| record.overlay.is_some()) else {
+            record.width = capped_width(requested, thumbnail, usable);
             record.position = Point {
                 x: u32::try_from(x.max(0)).unwrap_or(u32::MAX),
                 y: u32::try_from(y.max(0)).unwrap_or(u32::MAX),
             };
             return;
         };
-        let size = thumbnail_size(width, buffer_size);
-        let position = layout::clamp_position(x, y, size, usable);
-        let resized = overlay.size() != size;
-        let moved = overlay.position() != position;
-        if resized && !self.draw_chrome(address, size) {
-            return;
-        }
-        let Some(record) = self.records.get_mut(&address) else {
-            return;
-        };
-        record.position = position;
-        if let Some(overlay) = record.overlay.as_mut() {
-            if resized {
-                overlay.resize(size, position);
-            } else if moved {
-                overlay.move_to(position);
-            }
-        }
+        let (width, size, position) = fitted(requested, thumbnail, buffer_size, usable, (x, y));
+        record.width = width;
+        self.apply_geometry(address, size, (!pinned).then_some(Offset::from(position)));
     }
 
     fn mark_user_placed(&mut self, address: u64) {
@@ -1181,11 +1512,13 @@ impl App {
         }
     }
 
-    fn thumbnail_at(&self, surface: &WlSurface) -> Option<u64> {
-        self.records
-            .iter()
-            .find(|(_, r)| r.overlay.as_ref().is_some_and(|o| o.surface() == surface))
-            .map(|(address, _)| *address)
+    /// The record that owns `surface` and the monitor the surface is on.
+    fn surface_owner(&self, surface: &WlSurface) -> Option<(u64, usize)> {
+        self.records.iter().find_map(|(address, r)| {
+            r.surfaces()
+                .find(|(o, _, _)| o.surface() == surface)
+                .map(|(_, monitor, _)| (*address, monitor))
+        })
     }
 
     fn pointer_input(&mut self, pointer: &WlPointer, input: PointerInput) {
@@ -1220,7 +1553,8 @@ impl App {
                 Effect::Drag { address, offset } => {
                     self.drag(address, offset);
                 }
-                Effect::DragEnd { address } | Effect::ResizeEnd { address } => {
+                Effect::DragEnd { address } => self.drag_end(address),
+                Effect::ResizeEnd { address } => {
                     self.mark_user_placed(address);
                     self.layout_update(address);
                 }
@@ -1274,22 +1608,10 @@ impl App {
         });
     }
 
-    fn drag(&mut self, address: u64, offset: (f64, f64)) {
-        let Some(start) = self.press.filter(|p| p.address == address) else {
-            return;
-        };
-        let Some(size) = self
-            .records
-            .get(&address)
-            .and_then(|r| r.overlay.as_ref())
-            .map(Overlay::size)
-        else {
-            return;
-        };
-        let others: Vec<Rect> = self
-            .records
+    fn others_on(&self, monitor: usize, except: u64) -> Vec<Rect> {
+        self.records
             .iter()
-            .filter(|(other, _)| **other != address)
+            .filter(|(other, r)| **other != except && r.monitor == monitor)
             .filter_map(|(_, r)| {
                 r.overlay.as_ref().map(|o| Rect {
                     x: r.position.x,
@@ -1298,16 +1620,228 @@ impl App {
                     height: o.size().height,
                 })
             })
-            .collect();
-        let position = drag_position(
-            start.position,
-            offset,
+            .collect()
+    }
+
+    fn drag(&mut self, address: u64, offset: (f64, f64)) {
+        let Some(start) = self.press.filter(|p| p.address == address) else {
+            return;
+        };
+        let Some(record) = self.records.get(&address) else {
+            return;
+        };
+        if matches!(record.surface_state, SurfaceState::Landing { .. }) {
+            return;
+        }
+        let Some(size) = record.overlay.as_ref().map(Overlay::size) else {
+            return;
+        };
+        let home = record.monitor;
+        let origin = area_origin(&self.monitors[home]);
+        let pointer = pointer_global(origin, start.position, start.grab, offset);
+        let under = under_pointer(&self.monitors, pointer, start.monitor);
+        let others = self.others_on(under, address);
+        let at = dragged_origin(
+            desired_origin(origin, start.position, offset),
             size,
+            under,
+            &self.monitors,
             &others,
-            self.usable,
             self.snap_distance(),
         );
-        self.move_clamped(address, i64::from(position.x), i64::from(position.y));
+        if let Some(press) = self.press.as_mut() {
+            press.monitor = under;
+            press.at = Some(at);
+        }
+        let rect = Area {
+            x: at.0,
+            y: at.1,
+            width: i64::from(size.width),
+            height: i64::from(size.height),
+        };
+        let spawn = Spawn {
+            origin: at,
+            size,
+            factor: alpha_factor(config::MAX_OPACITY),
+        };
+        let touching = touched(&self.monitors, home, rect);
+        self.step_surfaces(address, SurfaceEvent::Touch(touching), Some(spawn));
+        let monitors = &self.monitors;
+        if let Some(record) = self.records.get_mut(&address) {
+            for (overlay, monitor, _) in record.surfaces_mut() {
+                let to = local_offset(at, &monitors[monitor]);
+                if overlay.position() != to {
+                    overlay.move_to(to);
+                }
+            }
+        }
+    }
+
+    /// Ends a drag: on home the rectangle is clamped and the width capped. Elsewhere the landing
+    /// surface takes over at its configure, where the commit clamps and caps.
+    fn drag_end(&mut self, address: u64) {
+        self.mark_user_placed(address);
+        let end = self
+            .press
+            .filter(|p| p.address == address)
+            .and_then(|p| p.at.map(|at| (p.monitor, at)));
+        if let Some(press) = self.press.as_mut().filter(|p| p.address == address) {
+            press.at = None;
+        }
+        let Some((landing, at)) = end else {
+            self.layout_update(address);
+            return;
+        };
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let Some(size) = record.overlay.as_ref().map(Overlay::size) else {
+            return;
+        };
+        let (home, width) = (record.monitor, record.width);
+        if landing == home {
+            self.step_surfaces(address, SurfaceEvent::ReleaseHome, None);
+            let relative = usable_local(at, &self.monitors[home]);
+            self.set_geometry(address, i64::from(width), Some(relative));
+            self.settle(address);
+            return;
+        }
+        let configured = record
+            .surface_on(landing)
+            .is_some_and(|o| o.is_configured());
+        let spawn = Spawn {
+            origin: at,
+            size,
+            factor: alpha_factor(config::MAX_OPACITY),
+        };
+        let event = SurfaceEvent::ReleaseAt {
+            monitor: landing,
+            configured,
+        };
+        self.step_surfaces(address, event, Some(spawn));
+        let pending = self
+            .records
+            .get(&address)
+            .is_some_and(|r| matches!(r.surface_state, SurfaceState::Landing { .. }));
+        if !pending {
+            self.settle(address);
+        }
+    }
+
+    /// Applies the surface state machine's answer to `event` and runs its actions. `spawn` is
+    /// needed by the events that can create a surface.
+    fn step_surfaces(&mut self, address: u64, event: SurfaceEvent, spawn: Option<Spawn>) {
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let (next, actions) = surface_step(&record.surface_state, event);
+        record.surface_state = next;
+        for action in actions {
+            if self.stop.is_some() {
+                return;
+            }
+            match action {
+                SurfaceAction::Create(monitor) => {
+                    if let Some(spawn) = &spawn {
+                        self.create_traveller(address, monitor, spawn);
+                    }
+                }
+                SurfaceAction::Destroy(monitor) => {
+                    if let Some(record) = self.records.get_mut(&address) {
+                        record.destroy_traveller(monitor);
+                    }
+                }
+                SurfaceAction::Present(monitor) => self.present_shown(address, monitor),
+                SurfaceAction::Commit(monitor) => self.commit_traveller(address, monitor),
+            }
+        }
+    }
+
+    fn create_traveller(&mut self, address: u64, monitor: usize, spawn: &Spawn) {
+        let position = local_offset(spawn.origin, &self.monitors[monitor]);
+        let Some(overlay) = self.new_overlay(monitor, position, spawn.size, spawn.factor) else {
+            return;
+        };
+        let Some(record) = self.records.get_mut(&address) else {
+            overlay.destroy();
+            return;
+        };
+        record.travellers.push(Traveller {
+            overlay,
+            monitor,
+            chromed: false,
+        });
+        self.draw_chrome(address, spawn.size, Some(monitor));
+    }
+
+    /// Shows the last presented buffer on the surface on `monitor`, once it is configured, at the
+    /// thumbnail size that buffer gives. Sends no position change.
+    fn present_shown(&mut self, address: u64, monitor: usize) {
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let (Some(shown), Some(buffer_size)) = (record.shown, record.buffer_size) else {
+            return;
+        };
+        let Some(buffer) = record.buffers[shown.slot]
+            .as_ref()
+            .map(|b| b.wl_buffer.clone())
+        else {
+            return;
+        };
+        let size = thumbnail_size(record.width, buffer_size);
+        let Some(overlay) = record.surface_on(monitor).filter(|o| o.is_configured()) else {
+            return;
+        };
+        let at = overlay.position();
+        overlay.present(&buffer, buffer_size, size, at, shown.y_invert);
+    }
+
+    /// The surface on `monitor` becomes the record's overlay, with the width capped and the
+    /// position clamped to that monitor. The old home surface goes without a `leave`.
+    fn commit_traveller(&mut self, address: u64, monitor: usize) {
+        self.cancel_gesture(address);
+        let Some(record) = self.records.get_mut(&address) else {
+            return;
+        };
+        let Some(at) = record.travellers.iter().position(|t| t.monitor == monitor) else {
+            return;
+        };
+        let traveller = record.travellers.remove(at);
+        let landed = traveller.overlay.position();
+        let width = i64::from(record.width);
+        record.monitor = monitor;
+        record.chromed = traveller.chromed;
+        if let Some(home) = record.overlay.replace(traveller.overlay) {
+            home.destroy();
+        }
+        if self.hovered == Some(address) {
+            self.hovered = None;
+        }
+        let rectangle = (i64::from(landed.x), i64::from(landed.y));
+        self.set_geometry(address, width, Some(rectangle));
+        let factor = alpha_factor(self.effective_opacity(address));
+        self.set_alpha(address, factor);
+        self.rerender_chrome(address);
+        self.recompute_placement();
+    }
+
+    /// Ends a gesture on the record whose surface is about to be destroyed: the compositor sends
+    /// the release to the destroyed surface, where `pointer_frame` cannot route it.
+    fn cancel_gesture(&mut self, address: u64) {
+        if self.gestures.active() == Some(address) && self.stop.is_none() {
+            self.press = None;
+            // The leave's effects are dropped: a cancelled gesture saves and moves nothing.
+            self.gestures.handle(PointerInput::Leave { address });
+        }
+    }
+
+    fn set_alpha(&mut self, address: u64, factor: u32) {
+        if let Some(record) = self.records.get_mut(&address) {
+            for (overlay, _, _) in record.surfaces_mut() {
+                overlay.set_alpha(factor);
+            }
+        }
     }
 
     /// A missing leave, for example a pointer capability loss, would leave a stale 100 %.
@@ -1332,23 +1866,19 @@ impl App {
         let Some(percent) = opacity_change(self.base_opacity(), before, after) else {
             return;
         };
-        let Some(overlay) = self
-            .records
-            .get_mut(&address)
-            .and_then(|r| r.overlay.as_mut())
-        else {
-            return;
-        };
-        overlay.set_alpha(alpha_factor(percent));
+        self.set_alpha(address, alpha_factor(percent));
         self.rerender_chrome(address);
     }
 
-    fn begin_press(&mut self, address: u64) {
+    fn begin_press(&mut self, address: u64, grab: (f64, f64)) {
         if let Some(record) = self.records.get(&address) {
             self.press = Some(PressStart {
                 address,
                 position: record.position,
+                grab,
                 width: record.width,
+                monitor: record.monitor,
+                at: None,
             });
         }
     }
@@ -1890,6 +2420,9 @@ impl App {
             {
                 frame.proxy.destroy();
             }
+            for traveller in record.travellers {
+                traveller.overlay.destroy();
+            }
             if let Some(overlay) = record.overlay {
                 overlay.destroy();
             }
@@ -1980,21 +2513,31 @@ impl LayerShellHandler for App {
         _: LayerSurfaceConfigure,
         _: u32,
     ) {
-        let Some(address) = self.thumbnail_at(layer.wl_surface()) else {
+        let Some((address, monitor)) = self.surface_owner(layer.wl_surface()) else {
             return;
         };
-        let Some(overlay) = self
-            .records
-            .get_mut(&address)
-            .and_then(|r| r.overlay.as_mut())
-        else {
+        let Some(record) = self.records.get_mut(&address) else {
             return;
         };
-        if overlay.is_configured() {
+        let home = monitor == record.monitor;
+        let Some(overlay) = record.surface_on(monitor).filter(|o| !o.is_configured()) else {
+            return;
+        };
+        overlay.set_configured();
+        if home {
+            self.feed(address, Input::OverlayConfigured);
             return;
         }
-        overlay.set_configured();
-        self.feed(address, Input::OverlayConfigured);
+        let landing = matches!(record.surface_state, SurfaceState::Landing { .. });
+        self.step_surfaces(address, SurfaceEvent::Configured(monitor), None);
+        let committed = landing
+            && self
+                .records
+                .get(&address)
+                .is_some_and(|r| r.surface_state == SurfaceState::Home);
+        if committed {
+            self.settle(address);
+        }
     }
 }
 
@@ -2174,7 +2717,7 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let Some(address) = self.thumbnail_at(&event.surface) else {
+            let Some((address, _)) = self.surface_owner(&event.surface) else {
                 continue;
             };
             let input = match &event.kind {
@@ -2192,7 +2735,7 @@ impl PointerHandler for App {
                 },
                 PointerEventKind::Press { button, .. } => {
                     if *button == BTN_LEFT {
-                        self.begin_press(address);
+                        self.begin_press(address, event.position);
                     }
                     PointerInput::Press {
                         address,
@@ -2358,22 +2901,346 @@ fn opacity_change(base: u32, hovered_before: bool, hovered_after: bool) -> Optio
     (before != after).then_some(after)
 }
 
-/// The position a drag gives a thumbnail: the press position plus the rounded offset, snapped to
-/// the usable edges and the other thumbnails, then clamped.
-fn drag_position(
+/// The pointer in layout coordinates: the origin of the usable area it started in, the press
+/// position of the thumbnail, the pointer's offset inside it at the press, and the drag offset.
+fn pointer_global(
+    origin: (i32, i32),
     start: Point,
+    grab: (f64, f64),
     offset: (f64, f64),
+) -> (f64, f64) {
+    (
+        f64::from(origin.0) + f64::from(start.x) + grab.0 + offset.0,
+        f64::from(origin.1) + f64::from(start.y) + grab.1 + offset.1,
+    )
+}
+
+/// A rectangle in layout coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Area {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+impl Area {
+    fn overlap(self, other: Area) -> i64 {
+        let width = (self.x + self.width).min(other.x + other.width) - self.x.max(other.x);
+        let height = (self.y + self.height).min(other.y + other.height) - self.y.max(other.y);
+        if width > 0 && height > 0 {
+            width * height
+        } else {
+            0
+        }
+    }
+}
+
+/// The monitor's usable area in layout coordinates.
+fn usable_global(monitor: &Monitor) -> Area {
+    let usable = monitor.usable_area();
+    let origin = area_origin(monitor);
+    Area {
+        x: i64::from(origin.0),
+        y: i64::from(origin.1),
+        width: i64::from(usable.width),
+        height: i64::from(usable.height),
+    }
+}
+
+/// The top-left of a dragged thumbnail before snapping: the press position plus the rounded
+/// offset, in layout coordinates.
+fn desired_origin(origin: (i32, i32), start: Point, offset: (f64, f64)) -> (i64, i64) {
+    (
+        i64::from(origin.0) + i64::from(start.x) + offset.0.round() as i64,
+        i64::from(origin.1) + i64::from(start.y) + offset.1.round() as i64,
+    )
+}
+
+/// Whether the usable areas, which do not overlap each other, cover all of `rect`.
+fn covered(rect: Area, areas: &[Area]) -> bool {
+    let whole = rect.width * rect.height;
+    whole > 0 && areas.iter().map(|a| rect.overlap(*a)).sum::<i64>() == whole
+}
+
+/// The top-left of the dragged rectangle in layout coordinates. It snaps in the usable area of
+/// the monitor under the pointer, `under`, to its edges and the thumbnails `others` on it, and
+/// rounds down to even there. The result is used as is when the usable areas of all monitors
+/// cover it; otherwise the snapped position is clamped into the usable area of `under`.
+fn dragged_origin(
+    desired: (i64, i64),
     size: Size,
+    under: usize,
+    monitors: &[Monitor],
     others: &[Rect],
-    usable: Size,
     distance: u32,
-) -> Point {
-    let origin = (
-        i64::from(start.x) + offset.0.round() as i64,
-        i64::from(start.y) + offset.1.round() as i64,
+) -> (i64, i64) {
+    let origin = area_origin(&monitors[under]);
+    let (ox, oy) = (i64::from(origin.0), i64::from(origin.1));
+    let usable = monitors[under].usable_area().size();
+    let snapped = layout::snap(
+        (desired.0 - ox, desired.1 - oy),
+        size,
+        others,
+        usable,
+        distance,
     );
-    let (x, y) = layout::snap(origin, size, others, usable, distance);
-    layout::clamp_position(x, y, size, usable)
+    let even = (layout::even_down(snapped.0), layout::even_down(snapped.1));
+    let rect = Area {
+        x: even.0 + ox,
+        y: even.1 + oy,
+        width: i64::from(size.width),
+        height: i64::from(size.height),
+    };
+    let areas: Vec<Area> = monitors.iter().map(usable_global).collect();
+    if covered(rect, &areas) {
+        return (rect.x, rect.y);
+    }
+    let clamped = layout::clamp_position(snapped.0, snapped.1, size, usable);
+    (ox + i64::from(clamped.x), oy + i64::from(clamped.y))
+}
+
+/// The monitors other than `home` whose usable area the rectangle overlaps, ascending.
+fn touched(monitors: &[Monitor], home: usize, rect: Area) -> Vec<usize> {
+    monitors
+        .iter()
+        .enumerate()
+        .filter(|(index, m)| *index != home && rect.overlap(usable_global(m)) > 0)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The width a request gets on a monitor with `usable`: negative requests count as zero.
+fn capped_width(requested: i64, thumbnail: &config::Thumbnail, usable: Size) -> u32 {
+    let requested = u32::try_from(requested.max(0)).unwrap_or(u32::MAX);
+    layout::effective_width(requested, thumbnail, usable)
+}
+
+/// The width a request gets on a monitor with `usable`, the size that width gives for a frame
+/// of `buffer`, and `at` (usable-relative) clamped.
+fn fitted(
+    width: i64,
+    thumbnail: &config::Thumbnail,
+    buffer: Size,
+    usable: Size,
+    at: (i64, i64),
+) -> (u32, Size, Point) {
+    let width = capped_width(width, thumbnail, usable);
+    let size = thumbnail_size(width, buffer);
+    (
+        width,
+        size,
+        layout::clamp_position(at.0, at.1, size, usable),
+    )
+}
+
+/// The monitor under `point` in layout coordinates. In a gap between monitors it is `last`.
+fn under_pointer(monitors: &[Monitor], point: (f64, f64), last: usize) -> usize {
+    hypr::monitor_at(monitors, point.0, point.1).unwrap_or(last)
+}
+
+/// Layout coordinates `at` relative to the top-left of the monitor's usable area.
+fn usable_local(at: (i64, i64), monitor: &Monitor) -> (i64, i64) {
+    let origin = area_origin(monitor);
+    (
+        at.0.saturating_sub(i64::from(origin.0)),
+        at.1.saturating_sub(i64::from(origin.1)),
+    )
+}
+
+/// The layout coordinates of `position`, a place relative to the monitor's usable area.
+fn layout_point(position: Point, monitor: &Monitor) -> (i64, i64) {
+    let origin = area_origin(monitor);
+    (
+        i64::from(origin.0) + i64::from(position.x),
+        i64::from(origin.1) + i64::from(position.y),
+    )
+}
+
+/// The margins of a surface on `monitor` that puts its top-left at layout coordinates `at`.
+fn local_offset(at: (i64, i64), monitor: &Monitor) -> Offset {
+    let (x, y) = usable_local(at, monitor);
+    let fit = |value: i64| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    Offset {
+        x: fit(x),
+        y: fit(y),
+    }
+}
+
+/// The unsigned usable-relative position of a margin pair known to be clamped.
+fn point_of(offset: Offset) -> Point {
+    Point {
+        x: u32::try_from(offset.x).unwrap_or(0),
+        y: u32::try_from(offset.y).unwrap_or(0),
+    }
+}
+
+/// The surfaces of one record after `event`, and the actions that take them there. Drag
+/// events during a pending landing change nothing.
+fn surface_step(state: &SurfaceState, event: SurfaceEvent) -> (SurfaceState, Vec<SurfaceAction>) {
+    use SurfaceAction::{Commit, Create, Destroy, Present};
+    let travellers: Vec<usize> = match state {
+        SurfaceState::Home => Vec::new(),
+        SurfaceState::Straddling(set) => set.clone(),
+        SurfaceState::Landing { monitor, others } => std::iter::once(*monitor)
+            .chain(others.iter().copied())
+            .collect(),
+    };
+    let destroy_all = || travellers.iter().map(|m| Destroy(*m)).collect();
+    let straddle = |set: Vec<usize>| {
+        if set.is_empty() {
+            SurfaceState::Home
+        } else {
+            SurfaceState::Straddling(set)
+        }
+    };
+    match (state, event) {
+        (SurfaceState::Landing { .. }, SurfaceEvent::Touch(_) | SurfaceEvent::ReleaseHome) => {
+            (state.clone(), Vec::new())
+        }
+        (SurfaceState::Landing { .. }, SurfaceEvent::ReleaseAt { .. }) => {
+            (state.clone(), Vec::new())
+        }
+        (_, SurfaceEvent::Touch(next)) => {
+            let mut actions: Vec<SurfaceAction> = travellers
+                .iter()
+                .filter(|m| !next.contains(m))
+                .map(|m| Destroy(*m))
+                .collect();
+            actions.extend(
+                next.iter()
+                    .filter(|m| !travellers.contains(m))
+                    .map(|m| Create(*m)),
+            );
+            (straddle(next), actions)
+        }
+        (_, SurfaceEvent::ReleaseHome) => (SurfaceState::Home, destroy_all()),
+        (
+            _,
+            SurfaceEvent::ReleaseAt {
+                monitor,
+                configured,
+            },
+        ) => {
+            let exists = travellers.contains(&monitor);
+            let others: Vec<usize> = travellers
+                .iter()
+                .copied()
+                .filter(|m| *m != monitor)
+                .collect();
+            if exists && configured {
+                let mut actions: Vec<SurfaceAction> = others.iter().map(|m| Destroy(*m)).collect();
+                actions.push(Commit(monitor));
+                (SurfaceState::Home, actions)
+            } else {
+                let actions = if exists {
+                    Vec::new()
+                } else {
+                    vec![Create(monitor)]
+                };
+                (SurfaceState::Landing { monitor, others }, actions)
+            }
+        }
+        (SurfaceState::Landing { monitor, others }, SurfaceEvent::Configured(at)) => {
+            if at == *monitor {
+                let mut actions = vec![Present(at)];
+                actions.extend(others.iter().map(|m| Destroy(*m)));
+                actions.push(Commit(at));
+                (SurfaceState::Home, actions)
+            } else if others.contains(&at) {
+                (state.clone(), vec![Present(at)])
+            } else {
+                (state.clone(), Vec::new())
+            }
+        }
+        (_, SurfaceEvent::Configured(at)) => {
+            let actions = if travellers.contains(&at) {
+                vec![Present(at)]
+            } else {
+                Vec::new()
+            };
+            (state.clone(), actions)
+        }
+        (_, SurfaceEvent::TearDown) => (SurfaceState::Home, destroy_all()),
+    }
+}
+
+/// What `settle` does after `relocation` chose `target`.
+#[derive(Debug, PartialEq, Eq)]
+enum Settle {
+    Relocate {
+        target: Option<usize>,
+        width: i64,
+        at: Option<(i64, i64)>,
+    },
+    Save,
+    Stay,
+}
+
+/// A saved record with an entry always applies the entry's geometry, so a second key change
+/// inside a move's window leaves the record where the layout holds it. `width` is the record's.
+fn settled(
+    target: Option<usize>,
+    origin: Origin,
+    entry: Option<&layout::Entry>,
+    width: u32,
+) -> Settle {
+    match (entry, target) {
+        (Some(entry), _) => Settle::Relocate {
+            target,
+            width: i64::from(entry.width),
+            at: Some((i64::from(entry.x), i64::from(entry.y))),
+        },
+        (None, Some(_)) => Settle::Relocate {
+            target,
+            width: i64::from(width),
+            at: None,
+        },
+        (None, None) if origin == Origin::User => Settle::Save,
+        (None, None) => Settle::Stay,
+    }
+}
+
+/// The monitor whose usable area bounds a record's geometry: the landing monitor while a
+/// landing is pending, else the record's own.
+fn bound_monitor(state: &SurfaceState, monitor: usize) -> usize {
+    match state {
+        SurfaceState::Landing { monitor, .. } => *monitor,
+        SurfaceState::Home | SurfaceState::Straddling(_) => monitor,
+    }
+}
+
+/// What asks where a record lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger<'a> {
+    /// `output` is the monitor the new key's entry names; `busy` is a drag or a pending landing.
+    KeyChange { output: Option<&'a str>, busy: bool },
+    /// A drop or a commit left the record on its landing monitor. `entry` is the current key's
+    /// saved entry, `None` without one, and the monitor it names.
+    Settled { entry: Option<Option<&'a str>> },
+}
+
+/// The monitor a record moves to, or `None` to stay on `monitor`. A key change goes to its
+/// entry's monitor or `default`, never while busy. After a settle a user-placed record stays,
+/// a default-placed one goes to `default`, a saved one to its entry's monitor or `default`, or
+/// stays without an entry.
+fn relocation(
+    trigger: Trigger,
+    monitors: &[Monitor],
+    origin: Origin,
+    monitor: usize,
+    default: usize,
+) -> Option<usize> {
+    let target = match trigger {
+        Trigger::KeyChange { busy: true, .. } => return None,
+        Trigger::KeyChange { output, .. } => monitor_for(monitors, output, default),
+        Trigger::Settled { .. } if origin == Origin::Default => default,
+        Trigger::Settled {
+            entry: Some(output),
+        } if origin == Origin::Saved => monitor_for(monitors, output, default),
+        Trigger::Settled { .. } => return None,
+    };
+    (target != monitor).then_some(target)
 }
 
 /// Whether a client sits at its default-row slot. The client of an active gesture keeps the
@@ -2614,8 +3481,8 @@ struct Startup {
     events: EventSocket,
     control: control::Server,
     clients: Clients,
-    scale: f64,
-    usable: Rect,
+    monitors: Vec<Monitor>,
+    default_monitor: usize,
     mode: DamageMode,
 }
 
@@ -2632,8 +3499,8 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         events,
         control,
         clients,
-        scale,
-        usable,
+        monitors,
+        default_monitor,
         mode,
     } = startup;
     let parts = match bind_wayland() {
@@ -2694,11 +3561,8 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         save_timer: None,
         config,
         font,
-        scale,
-        usable: Size {
-            width: usable.width,
-            height: usable.height,
-        },
+        monitors,
+        default_monitor,
         mode,
         reporter,
         requests,
@@ -2717,10 +3581,8 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
         .roundtrip(&mut app)
         .map_err(wayland)
         .and_then(|_| {
-            if app.output().is_none() {
-                return Err(SetupError::NoOutput(app.config.output.clone()));
-            }
-            Ok(())
+            app.wl_output(&app.monitors[app.default_monitor].name)
+                .map(|_| ())
         })
         .and_then(|()| {
             WaylandSource::new(conn, queue)
@@ -2735,25 +3597,52 @@ fn setup(startup: Startup, loop_handle: LoopHandle<'static, App>) -> App {
 }
 
 struct HyprState {
-    usable: Rect,
-    scale: f64,
+    monitors: Vec<Monitor>,
+    default_monitor: usize,
     snapshot: Vec<hypr::Client>,
     active: Option<u64>,
 }
 
-/// Reads the monitor, the client list and the active window. The error is the `exit` reason.
-fn read_hyprland(requests: &Path, output: &str) -> Result<HyprState, String> {
-    let monitors = query(requests, "j/monitors", hypr::parse_monitors)?;
-    let Some(monitor) = monitors.iter().find(|m| m.name == output) else {
-        return Err(format!("no monitor named {output} in j/monitors"));
-    };
+/// The index of the monitor new thumbnails start on: the one named `output`, or the focused one
+/// when `output` is unset. The error is the `exit` reason.
+fn default_monitor(monitors: &[Monitor], output: Option<&str>) -> Result<usize, String> {
+    match output {
+        Some(name) => monitors
+            .iter()
+            .position(|m| m.name == name)
+            .ok_or_else(|| format!("no monitor named {name} in j/monitors")),
+        None => monitors
+            .iter()
+            .position(|m| m.focused)
+            .ok_or_else(|| "no focused monitor in j/monitors".to_string()),
+    }
+}
+
+/// The monitor a saved entry names, or `default` when it names none or one that is absent.
+fn monitor_for(monitors: &[Monitor], output: Option<&str>, default: usize) -> usize {
+    output
+        .and_then(|name| monitors.iter().position(|m| m.name == name))
+        .unwrap_or(default)
+}
+
+/// The top-left of the monitor's usable area in layout coordinates.
+fn area_origin(monitor: &Monitor) -> (i32, i32) {
     let usable = monitor.usable_area();
-    let scale = monitor.scale;
+    (
+        monitor.x.saturating_add_unsigned(usable.x),
+        monitor.y.saturating_add_unsigned(usable.y),
+    )
+}
+
+/// Reads the monitors, the client list and the active window. The error is the `exit` reason.
+fn read_hyprland(requests: &Path, output: Option<&str>) -> Result<HyprState, String> {
+    let monitors = query(requests, "j/monitors", hypr::parse_monitors)?;
+    let default_monitor = default_monitor(&monitors, output)?;
     let snapshot = query(requests, "j/clients", hypr::parse_clients)?;
     let active = query(requests, "j/activewindow", hypr::parse_active_window)?;
     Ok(HyprState {
-        usable,
-        scale,
+        monitors,
+        default_monitor,
         snapshot,
         active,
     })
@@ -2856,11 +3745,11 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
         Err(e) => fail(&mut reporter, 1, e, None),
     };
     let HyprState {
-        usable,
-        scale,
+        monitors,
+        default_monitor,
         snapshot,
         active,
-    } = match read_hyprland(&sockets.requests, &config.output) {
+    } = match read_hyprland(&sockets.requests, config.output.as_deref()) {
         Ok(state) => state,
         Err(reason) => fail(&mut reporter, 1, reason, remove_control(control)),
     };
@@ -2869,10 +3758,11 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
     } else {
         DamageMode::Recommit
     };
+    let start_monitor = &monitors[default_monitor];
     let start = Line::Start {
-        output: config.output.clone(),
-        scale,
-        usable,
+        output: start_monitor.name.clone(),
+        scale: start_monitor.scale,
+        usable: start_monitor.usable_area(),
         mode,
         config: config_read,
         layout: layout_path.clone(),
@@ -2891,9 +3781,9 @@ fn prepare(args: &cli::Args, mut reporter: Reporter) -> (Startup, Vec<hypr::Clie
         requests: sockets.requests,
         events,
         control,
-        clients: Clients::new(active),
-        scale,
-        usable,
+        clients: Clients::new(active, Box::new(clients::read_cmdline)),
+        monitors,
+        default_monitor,
         mode,
     };
     (startup, snapshot)
@@ -2974,8 +3864,7 @@ fn main() -> ! {
         if app.stop.is_some() {
             break;
         }
-        let user_id = app.game_user_id(entry);
-        let changes = app.clients.add(entry, user_id);
+        let changes = app.clients.add(entry);
         app.apply_changes(changes);
     }
     if let Err(e) = app.insert_event_source() {
@@ -3288,19 +4177,263 @@ mod tests {
         }
     }
 
+    fn monitor(name: &str, x: i32, y: i32, width: u32, scale: f64, focused: bool) -> Monitor {
+        Monitor {
+            name: name.to_string(),
+            x,
+            y,
+            width,
+            height: width * 9 / 16,
+            scale,
+            transform: 0,
+            reserved: [0, 34, 0, 0],
+            focused,
+        }
+    }
+
+    fn layout_monitors() -> Vec<Monitor> {
+        vec![
+            monitor("DP-1", 0, 0, 1920, 1.0, false),
+            monitor("DP-3", 1920, 0, 3840, 1.5, true),
+            monitor("HDMI-A-1", 5000, 0, 1920, 1.0, false),
+        ]
+    }
+
     #[test]
-    fn drag_position_cases() {
-        let size = Size {
+    fn default_monitor_cases() {
+        let monitors = layout_monitors();
+        let unfocused: Vec<Monitor> = monitors
+            .iter()
+            .cloned()
+            .map(|m| Monitor {
+                focused: false,
+                ..m
+            })
+            .collect();
+        type Case<'a> = (
+            &'a str,
+            &'a [Monitor],
+            Option<&'a str>,
+            Result<usize, &'a str>,
+        );
+        let two_focused: Vec<Monitor> = monitors
+            .iter()
+            .cloned()
+            .map(|m| Monitor {
+                focused: m.name != "DP-1",
+                ..m
+            })
+            .collect();
+        let cases: [Case; 8] = [
+            ("named and present", &monitors, Some("HDMI-A-1"), Ok(2)),
+            (
+                "named and absent",
+                &monitors,
+                Some("DP-9"),
+                Err("no monitor named DP-9 in j/monitors"),
+            ),
+            ("unset with one focused", &monitors, None, Ok(1)),
+            (
+                "unset with none focused",
+                &unfocused,
+                None,
+                Err("no focused monitor in j/monitors"),
+            ),
+            ("named wins over focus", &monitors, Some("DP-1"), Ok(0)),
+            ("two focused, the first wins", &two_focused, None, Ok(1)),
+            (
+                "named, empty list",
+                &[],
+                Some("DP-1"),
+                Err("no monitor named DP-1 in j/monitors"),
+            ),
+            (
+                "unset, empty list",
+                &[],
+                None,
+                Err("no focused monitor in j/monitors"),
+            ),
+        ];
+        for (name, monitors, output, want) in cases {
+            let want = want.map_err(String::from);
+            assert_eq!(default_monitor(monitors, output), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn monitor_for_cases() {
+        let monitors = layout_monitors();
+        let cases = [
+            ("names a monitor", Some("HDMI-A-1"), 2),
+            ("names an absent monitor", Some("DP-9"), 1),
+            ("names none", None, 1),
+        ];
+        for (name, output, want) in cases {
+            assert_eq!(monitor_for(&monitors, output, 1), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn area_origin_cases() {
+        let at = |x, y, reserved| Monitor {
+            x,
+            y,
+            reserved,
+            ..monitor("M", 0, 0, 1920, 1.0, false)
+        };
+        let cases = [
+            ("top bar", at(0, 0, [0, 34, 0, 0]), (0, 34), (1920, 1046)),
+            (
+                "scaled",
+                layout_monitors()[1].clone(),
+                (1920, 34),
+                (2560, 1406),
+            ),
+            (
+                "negative position",
+                at(-1920, -200, [0, 34, 0, 0]),
+                (-1920, -166),
+                (1920, 1046),
+            ),
+            (
+                "left reserve",
+                at(0, 0, [48, 0, 0, 0]),
+                (48, 0),
+                (1872, 1080),
+            ),
+            (
+                "left reserve at a position",
+                at(1920, 0, [48, 0, 0, 0]),
+                (1968, 0),
+                (1872, 1080),
+            ),
+        ];
+        for (name, m, origin, size) in cases {
+            assert_eq!(area_origin(&m), origin, "{name}");
+            let want = Size {
+                width: size.0,
+                height: size.1,
+            };
+            assert_eq!(m.usable_area().size(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn pointer_global_cases() {
+        let cases = [
+            (
+                "no movement",
+                (0, 34),
+                (100, 50),
+                (10.0, 20.0),
+                (0.0, 0.0),
+                (110.0, 104.0),
+            ),
+            (
+                "offset moves it",
+                (1920, 34),
+                (100, 50),
+                (10.0, 20.0),
+                (-5.5, 7.25),
+                (2024.5, 111.25),
+            ),
+        ];
+        for (name, origin, start, grab, offset, want) in cases {
+            let start = Point {
+                x: start.0,
+                y: start.1,
+            };
+            assert_eq!(pointer_global(origin, start, grab, offset), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn desired_origin_cases() {
+        let cases = [
+            ("no movement", (0, 34), (100, 50), (0.0, 0.0), (100, 84)),
+            (
+                "offset rounds per axis",
+                (1920, 34),
+                (100, 50),
+                (-5.5, 7.25),
+                (2014, 91),
+            ),
+            (
+                "half rounds away from zero",
+                (0, 0),
+                (1000, 500),
+                (3.5, -2.5),
+                (1004, 497),
+            ),
+            (
+                "left of the layout",
+                (0, 0),
+                (10, 10),
+                (-40.0, -40.0),
+                (-30, -30),
+            ),
+        ];
+        for (name, origin, start, offset, want) in cases {
+            let start = Point {
+                x: start.0,
+                y: start.1,
+            };
+            assert_eq!(desired_origin(origin, start, offset), want, "{name}");
+        }
+    }
+
+    fn usable_areas(monitors: &[Monitor]) -> Vec<Area> {
+        monitors.iter().map(usable_global).collect()
+    }
+
+    #[test]
+    fn covered_cases() {
+        let areas = usable_areas(&layout_monitors());
+        let rect = |x, y| Area {
+            x,
+            y,
             width: 480,
             height: 264,
         };
-        let usable = Size {
-            width: 2560,
-            height: 1406,
-        };
-        let odd = Size {
-            width: 2561,
-            height: 1406,
+        let cases = [
+            ("inside one", &areas[..], rect(100, 134), true),
+            ("straddles two monitors", &areas[..], rect(1700, 134), true),
+            ("over a bar region", &areas[..], rect(100, 0), false),
+            ("past the last monitor", &areas[..], rect(4300, 100), false),
+            (
+                "below the shorter monitor",
+                &areas[..],
+                rect(1800, 1000),
+                false,
+            ),
+            (
+                "in the gap between monitors",
+                &areas[..],
+                rect(4500, 100),
+                false,
+            ),
+            ("no monitors", &[][..], rect(0, 0), false),
+            (
+                "zero-area rectangle inside a monitor",
+                &areas[..],
+                Area {
+                    width: 0,
+                    ..rect(100, 134)
+                },
+                false,
+            ),
+        ];
+        for (name, areas, rect, want) in cases {
+            assert_eq!(covered(rect, areas), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn dragged_origin_cases() {
+        let monitors = layout_monitors();
+        let size = Size {
+            width: 480,
+            height: 264,
         };
         let neighbour = Rect {
             x: 1000,
@@ -3308,81 +4441,903 @@ mod tests {
             width: 320,
             height: 176,
         };
-        let left = Rect {
-            x: 100,
-            y: 400,
-            width: 320,
-            height: 176,
+        type Case<'a> = (
+            &'a str,
+            &'a [Monitor],
+            (i64, i64),
+            usize,
+            &'a [Rect],
+            (i64, i64),
+        );
+        let cases: [Case; 8] = [
+            (
+                "single monitor, inside",
+                &monitors[..1],
+                (100, 134),
+                0,
+                &[],
+                (100, 134),
+            ),
+            (
+                "single monitor, clamped",
+                &monitors[..1],
+                (-50, -50),
+                0,
+                &[],
+                (0, 34),
+            ),
+            (
+                "straddles two monitors, used as is",
+                &monitors[..2],
+                (1700, 134),
+                1,
+                &[],
+                (1700, 134),
+            ),
+            (
+                "straddling, snapped to the usable edge of the pointer's monitor",
+                &monitors[..2],
+                (1925, 134),
+                1,
+                &[],
+                (1920, 134),
+            ),
+            (
+                "over a bar region, clamped",
+                &monitors[..2],
+                (100, 10),
+                0,
+                &[],
+                (100, 34),
+            ),
+            (
+                "past the outer edge, clamped into the pointer's monitor",
+                &monitors[..2],
+                (4400, 134),
+                1,
+                &[],
+                (4000, 134),
+            ),
+            (
+                "snapped to a thumbnail",
+                &monitors[..2],
+                (1315, 84),
+                0,
+                &[neighbour],
+                (1320, 84),
+            ),
+            (
+                "odd position rounds down to even",
+                &monitors[..1],
+                (101, 135),
+                0,
+                &[],
+                (100, 134),
+            ),
+        ];
+        for (name, monitors, desired, under, others, want) in cases {
+            let got = dragged_origin(desired, size, under, monitors, others, 10);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn dragged_origin_usable_width_cases() {
+        let size = Size {
+            width: 480,
+            height: 264,
+        };
+        let cases = [
+            (
+                "even width, right-edge snap",
+                2560,
+                (2075, 134),
+                (2080, 134),
+            ),
+            (
+                "odd width rounds the right-edge snap down",
+                2561,
+                (2075, 134),
+                (2080, 134),
+            ),
+            (
+                "snap past the edge is clamped back",
+                2560,
+                (2600, 134),
+                (2080, 134),
+            ),
+        ];
+        for (name, width, desired, want) in cases {
+            let monitors = [Monitor {
+                height: 1440,
+                ..monitor("M", 0, 0, width, 1.0, true)
+            }];
+            let got = dragged_origin(desired, size, 0, &monitors, &[], 10);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn touched_cases() {
+        let monitors = layout_monitors();
+        let flat = |name, x, y| Monitor {
+            reserved: [0; 4],
+            ..monitor(name, x, y, 1920, 1.0, false)
+        };
+        let corner = [flat("A", 0, 0), flat("B", 1920, 0), flat("C", 0, 1080)];
+        let rect = |x, y| Area {
+            x,
+            y,
+            width: 480,
+            height: 264,
+        };
+        let cases = [
+            ("inside home", &monitors[..], 0, rect(100, 134), vec![]),
+            (
+                "scale 1 into scale 1.5",
+                &monitors[..],
+                0,
+                rect(1700, 134),
+                vec![1],
+            ),
+            (
+                "scale 1.5 into scale 1",
+                &monitors[..],
+                1,
+                rect(1700, 134),
+                vec![0],
+            ),
+            (
+                "bar region of the neighbour",
+                &monitors[..],
+                0,
+                Area {
+                    x: 1700,
+                    y: 0,
+                    width: 480,
+                    height: 30,
+                },
+                vec![],
+            ),
+            (
+                "edge contact only",
+                &monitors[..],
+                0,
+                rect(1440, 134),
+                vec![],
+            ),
+            ("third monitor", &monitors[..], 0, rect(4900, 134), vec![2]),
+            (
+                "corner of three monitors",
+                &corner[..],
+                0,
+                rect(1800, 1000),
+                vec![1, 2],
+            ),
+        ];
+        for (name, monitors, home, rect, want) in cases {
+            assert_eq!(touched(monitors, home, rect), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn fitted_cases() {
+        let thumbnail = config::Thumbnail {
+            width: 480,
+            min_width: 160,
+            max_width: 1600,
+            opacity: 100,
+            snap_distance: 10,
+        };
+        let buffer = Size {
+            width: 2560,
+            height: 1406,
+        };
+        let usable = |width, height| Size { width, height };
+        let size = |width, height| Size { width, height };
+        let at = |x, y| Point { x, y };
+        let cases = [
+            (
+                "fits",
+                480,
+                usable(2560, 1000),
+                (100, 134),
+                (480, size(480, 264), at(100, 134)),
+            ),
+            (
+                "landing without a resize is unchanged",
+                480,
+                usable(2560, 1000),
+                (80, 100),
+                (480, size(480, 264), at(80, 100)),
+            ),
+            (
+                "wider than the usable width",
+                1280,
+                usable(1080, 1000),
+                (0, 0),
+                (1080, size(1080, 594), at(0, 0)),
+            ),
+            (
+                "width grown past the landing monitor is capped and the position clamped",
+                1280,
+                usable(1080, 1000),
+                (80, 100),
+                (1080, size(1080, 594), at(0, 100)),
+            ),
+            (
+                "landing monitor's width on a narrower monitor",
+                1128,
+                usable(1080, 1000),
+                (0, 0),
+                (1080, size(1080, 594), at(0, 0)),
+            ),
+            (
+                "grown past the old monitor's usable width",
+                1120,
+                usable(2560, 1000),
+                (0, 0),
+                (1120, size(1120, 616), at(0, 0)),
+            ),
+            (
+                "negative request",
+                -5,
+                usable(2560, 1000),
+                (0, 0),
+                (160, size(160, 88), at(0, 0)),
+            ),
+            (
+                "request above u32::MAX",
+                5_000_000_000,
+                usable(2560, 1000),
+                (0, 0),
+                (1600, size(1600, 878), at(0, 0)),
+            ),
+            (
+                "odd request rounds down",
+                481,
+                usable(2560, 1000),
+                (0, 0),
+                (480, size(480, 264), at(0, 0)),
+            ),
+            (
+                "below the minimum",
+                100,
+                usable(2560, 1000),
+                (0, 0),
+                (160, size(160, 88), at(0, 0)),
+            ),
+            (
+                "above the configured maximum",
+                2000,
+                usable(2560, 1000),
+                (0, 0),
+                (1600, size(1600, 878), at(0, 0)),
+            ),
+            (
+                "left of the area",
+                480,
+                usable(2560, 1000),
+                (-220, 100),
+                (480, size(480, 264), at(0, 100)),
+            ),
+            (
+                "above the area",
+                480,
+                usable(2560, 1000),
+                (80, -34),
+                (480, size(480, 264), at(80, 0)),
+            ),
+            (
+                "beyond the right edge",
+                480,
+                usable(2560, 1000),
+                (2480, 100),
+                (480, size(480, 264), at(2080, 100)),
+            ),
+            (
+                "beyond the bottom edge",
+                480,
+                usable(1920, 1046),
+                (100, 966),
+                (480, size(480, 264), at(100, 782)),
+            ),
+            (
+                "odd position rounds down to even",
+                480,
+                usable(2560, 1000),
+                (101, 135),
+                (480, size(480, 264), at(100, 134)),
+            ),
+        ];
+        for (name, width, usable, position, want) in cases {
+            assert_eq!(
+                fitted(width, &thumbnail, buffer, usable, position),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_pointer_cases() {
+        let monitors = layout_monitors();
+        let cases = [
+            ("on the first monitor", (100.0, 100.0), 1, 0),
+            ("on the second monitor", (2000.0, 100.0), 0, 1),
+            (
+                "at the shared edge, the right monitor",
+                (1920.0, 100.0),
+                0,
+                1,
+            ),
+            ("in a gap keeps the last monitor", (4600.0, 100.0), 1, 1),
+            ("in a gap keeps the first monitor", (4600.0, 100.0), 0, 0),
+            ("below every monitor", (100.0, 5000.0), 2, 2),
+        ];
+        for (name, point, last, want) in cases {
+            assert_eq!(under_pointer(&monitors, point, last), want, "{name}");
+        }
+    }
+
+    fn placed(x: i32, y: i32, reserved: [u32; 4]) -> Monitor {
+        Monitor {
+            x,
+            y,
+            reserved,
+            ..monitor("M", 0, 0, 1920, 1.0, false)
+        }
+    }
+
+    #[test]
+    fn local_offset_cases() {
+        let scaled = layout_monitors()[1].clone();
+        let flat = placed(0, 0, [0; 4]);
+        let cases = [
+            (
+                "scale 1.0",
+                placed(0, 0, [0, 34, 0, 0]),
+                (100, 134),
+                (100, 100),
+                (100, 100),
+            ),
+            (
+                "scale 1.5",
+                scaled.clone(),
+                (2000, 134),
+                (80, 100),
+                (80, 100),
+            ),
+            (
+                "monitor at a negative position",
+                placed(-1920, -200, [0, 34, 0, 0]),
+                (-1900, -100),
+                (20, 66),
+                (20, 66),
+            ),
+            (
+                "left reserve, a negative local coordinate",
+                placed(0, 0, [48, 0, 0, 0]),
+                (40, 10),
+                (-8, 10),
+                (-8, 10),
+            ),
+            (
+                "a point past the surface size",
+                scaled,
+                (6000, 3000),
+                (4080, 2966),
+                (4080, 2966),
+            ),
+            (
+                "beyond the i32 range",
+                flat,
+                (i64::MAX, i64::MIN),
+                (i64::MAX, i64::MIN),
+                (i32::MAX, i32::MIN),
+            ),
+        ];
+        for (name, monitor, at, relative, (x, y)) in cases {
+            assert_eq!(usable_local(at, &monitor), relative, "{name} relative");
+            assert_eq!(local_offset(at, &monitor), Offset { x, y }, "{name} offset");
+        }
+    }
+
+    #[test]
+    fn layout_point_cases() {
+        let cases = [
+            (
+                "scale 1.0",
+                placed(0, 0, [0, 34, 0, 0]),
+                (100, 100),
+                (100, 134),
+            ),
+            (
+                "scale 1.5",
+                layout_monitors()[1].clone(),
+                (80, 100),
+                (2000, 134),
+            ),
+            (
+                "monitor at a negative position",
+                placed(-1920, -200, [0, 34, 0, 0]),
+                (20, 66),
+                (-1900, -100),
+            ),
+            (
+                "left reserve",
+                placed(0, 0, [48, 0, 0, 0]),
+                (0, 10),
+                (48, 10),
+            ),
+        ];
+        for (name, monitor, (x, y), want) in cases {
+            assert_eq!(layout_point(Point { x, y }, &monitor), want, "{name}");
+            assert_eq!(
+                usable_local(want, &monitor),
+                (i64::from(x), i64::from(y)),
+                "{name} inverse"
+            );
+        }
+    }
+
+    #[test]
+    fn point_of_cases() {
+        let cases = [
+            ("inside", (80, 100), (80, 100)),
+            ("origin", (0, 0), (0, 0)),
+            ("negative x", (-8, 10), (0, 10)),
+            ("negative y", (10, -8), (10, 0)),
+            (
+                "largest",
+                (i32::MAX, i32::MAX),
+                (2_147_483_647, 2_147_483_647),
+            ),
+        ];
+        for (name, (x, y), (want_x, want_y)) in cases {
+            let want = Point {
+                x: want_x,
+                y: want_y,
+            };
+            assert_eq!(point_of(Offset { x, y }), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn bound_monitor_cases() {
+        let cases = [
+            ("home", SurfaceState::Home, 0, 0),
+            ("straddling", SurfaceState::Straddling(vec![1, 2]), 0, 0),
+            (
+                "landing",
+                SurfaceState::Landing {
+                    monitor: 2,
+                    others: vec![1],
+                },
+                0,
+                2,
+            ),
+        ];
+        for (name, state, monitor, want) in cases {
+            assert_eq!(bound_monitor(&state, monitor), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn relocation_cases() {
+        let monitors = layout_monitors();
+        let key = |output, busy| Trigger::KeyChange { output, busy };
+        let cases = [
+            (
+                "key change to a present monitor",
+                key(Some("HDMI-A-1"), false),
+                Origin::Saved,
+                0,
+                1,
+                Some(2),
+            ),
+            (
+                "key change to the record's own monitor",
+                key(Some("DP-1"), false),
+                Origin::Saved,
+                0,
+                1,
+                None,
+            ),
+            (
+                "entry without output goes to the default monitor",
+                key(None, false),
+                Origin::Saved,
+                2,
+                1,
+                Some(1),
+            ),
+            (
+                "entry naming an absent monitor goes to the default monitor",
+                key(Some("DP-9"), false),
+                Origin::Saved,
+                2,
+                1,
+                Some(1),
+            ),
+            (
+                "default placement on the default monitor",
+                key(None, false),
+                Origin::Default,
+                1,
+                1,
+                None,
+            ),
+            (
+                "default placement away from the default monitor",
+                key(None, false),
+                Origin::Default,
+                0,
+                1,
+                Some(1),
+            ),
+            (
+                "key change during a drag or a landing, present monitor",
+                key(Some("HDMI-A-1"), true),
+                Origin::Saved,
+                0,
+                1,
+                None,
+            ),
+            (
+                "key change during a drag or a landing, default",
+                key(None, true),
+                Origin::Default,
+                0,
+                1,
+                None,
+            ),
+            (
+                "drop of a user placement stays",
+                Trigger::Settled { entry: None },
+                Origin::User,
+                2,
+                1,
+                None,
+            ),
+            (
+                "drop of a default placement returns to the default monitor",
+                Trigger::Settled { entry: None },
+                Origin::Default,
+                2,
+                1,
+                Some(1),
+            ),
+            (
+                "drop of a default placement on the default monitor",
+                Trigger::Settled { entry: None },
+                Origin::Default,
+                1,
+                1,
+                None,
+            ),
+            (
+                "saved placement on its entry's monitor",
+                Trigger::Settled {
+                    entry: Some(Some("HDMI-A-1")),
+                },
+                Origin::Saved,
+                2,
+                1,
+                None,
+            ),
+            (
+                "saved placement, entry names another present monitor",
+                Trigger::Settled {
+                    entry: Some(Some("HDMI-A-1")),
+                },
+                Origin::Saved,
+                0,
+                1,
+                Some(2),
+            ),
+            (
+                "saved placement, entry without output, on the default monitor",
+                Trigger::Settled { entry: Some(None) },
+                Origin::Saved,
+                1,
+                1,
+                None,
+            ),
+            (
+                "saved placement, entry without output, off the default monitor",
+                Trigger::Settled { entry: Some(None) },
+                Origin::Saved,
+                2,
+                1,
+                Some(1),
+            ),
+            (
+                "saved placement, entry names an absent monitor",
+                Trigger::Settled {
+                    entry: Some(Some("DP-9")),
+                },
+                Origin::Saved,
+                2,
+                1,
+                Some(1),
+            ),
+            (
+                "saved placement without an entry on the default monitor",
+                Trigger::Settled { entry: None },
+                Origin::Saved,
+                1,
+                1,
+                None,
+            ),
+            (
+                "saved placement without an entry off the default monitor",
+                Trigger::Settled { entry: None },
+                Origin::Saved,
+                2,
+                1,
+                None,
+            ),
+            (
+                "user placement ignores the entry's monitor",
+                Trigger::Settled {
+                    entry: Some(Some("HDMI-A-1")),
+                },
+                Origin::User,
+                0,
+                1,
+                None,
+            ),
+        ];
+        for (name, trigger, origin, monitor, default, want) in cases {
+            let got = relocation(trigger, &monitors, origin, monitor, default);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn settled_cases() {
+        let entry = |width, x, y| layout::Entry {
+            x,
+            y,
+            width,
+            output: None,
+        };
+        let relocate = |target, width, at| Settle::Relocate { target, width, at };
+        let cases = [
+            (
+                "saved, entry on the same monitor, geometry applied",
+                None,
+                Origin::Saved,
+                Some(entry(400, 30, 40)),
+                relocate(None, 400, Some((30, 40))),
+            ),
+            (
+                "saved, entry on another monitor, moves with the entry's geometry",
+                Some(2),
+                Origin::Saved,
+                Some(entry(400, 30, 40)),
+                relocate(Some(2), 400, Some((30, 40))),
+            ),
+            (
+                "saved without an entry stays",
+                None,
+                Origin::Saved,
+                None,
+                Settle::Stay,
+            ),
+            (
+                "default placement moves to its row",
+                Some(1),
+                Origin::Default,
+                None,
+                relocate(Some(1), 480, None),
+            ),
+            (
+                "default placement on the default monitor stays",
+                None,
+                Origin::Default,
+                None,
+                Settle::Stay,
+            ),
+            (
+                "user placement is saved",
+                None,
+                Origin::User,
+                None,
+                Settle::Save,
+            ),
+        ];
+        for (name, target, origin, entry, want) in cases {
+            assert_eq!(settled(target, origin, entry.as_ref(), 480), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn surface_step_cases() {
+        use SurfaceAction::{Commit, Create, Destroy, Present};
+        use SurfaceEvent::{Configured, ReleaseAt, ReleaseHome, TearDown, Touch};
+        use SurfaceState::{Home, Landing, Straddling};
+        let landing = |monitor, others: &[usize]| Landing {
+            monitor,
+            others: others.to_vec(),
         };
         type Case<'a> = (
             &'a str,
-            (u32, u32),
-            (f64, f64),
-            &'a [Rect],
-            Size,
-            (u32, u32),
+            SurfaceState,
+            SurfaceEvent,
+            SurfaceState,
+            Vec<SurfaceAction>,
         );
-        let cases: [Case; 6] = [
+        let cases: Vec<Case> = vec![
+            ("home, still home", Home, Touch(vec![]), Home, vec![]),
             (
-                "snapped to a neighbour",
-                (1200, 50),
-                (115.4, 0.2),
-                &[neighbour],
-                usable,
-                (1320, 50),
+                "home to straddling",
+                Home,
+                Touch(vec![1]),
+                Straddling(vec![1]),
+                vec![Create(1)],
             ),
             (
-                "odd usable width rounds the right-edge snap down to even",
-                (2000, 50),
-                (75.0, 0.0),
-                &[],
-                odd,
-                (2080, 50),
+                "corner of three monitors",
+                Home,
+                Touch(vec![1, 2]),
+                Straddling(vec![1, 2]),
+                vec![Create(1), Create(2)],
             ),
             (
-                "snap outside the usable area is clamped back",
-                (0, 50),
-                (-375.0, 0.0),
-                &[left],
-                usable,
-                (0, 50),
+                "corner left for one monitor",
+                Straddling(vec![1, 2]),
+                Touch(vec![2]),
+                Straddling(vec![2]),
+                vec![Destroy(1)],
             ),
             (
-                "negative origin without a candidate",
-                (8, 8),
-                (-50.0, -50.0),
-                &[],
-                usable,
-                (0, 0),
+                "third monitor entered",
+                Straddling(vec![1]),
+                Touch(vec![2]),
+                Straddling(vec![2]),
+                vec![Destroy(1), Create(2)],
             ),
             (
-                "offset rounds half away from zero, clamp rounds down to even",
-                (1000, 500),
-                (3.5, -2.5),
-                &[],
-                usable,
-                (1004, 496),
+                "third monitor left",
+                Straddling(vec![2]),
+                Touch(vec![]),
+                Home,
+                vec![Destroy(2)],
             ),
             (
-                "a release's final offset gives the saved position",
-                (1200, 50),
-                (114.6, 0.0),
-                &[neighbour],
-                usable,
-                (1320, 50),
+                "same monitors",
+                Straddling(vec![1]),
+                Touch(vec![1]),
+                Straddling(vec![1]),
+                vec![],
+            ),
+            (
+                "drag events while landing change nothing",
+                landing(1, &[]),
+                Touch(vec![]),
+                landing(1, &[]),
+                vec![],
+            ),
+            ("release on home from home", Home, ReleaseHome, Home, vec![]),
+            (
+                "release on home destroys every traveller",
+                Straddling(vec![1, 2]),
+                ReleaseHome,
+                Home,
+                vec![Destroy(1), Destroy(2)],
+            ),
+            (
+                "release on a configured traveller commits",
+                Straddling(vec![1, 2]),
+                ReleaseAt {
+                    monitor: 1,
+                    configured: true,
+                },
+                Home,
+                vec![Destroy(2), Commit(1)],
+            ),
+            (
+                "release before the traveller's configure",
+                Straddling(vec![1, 2]),
+                ReleaseAt {
+                    monitor: 1,
+                    configured: false,
+                },
+                landing(1, &[2]),
+                vec![],
+            ),
+            (
+                "release where no traveller exists yet",
+                Straddling(vec![2]),
+                ReleaseAt {
+                    monitor: 1,
+                    configured: false,
+                },
+                landing(1, &[2]),
+                vec![Create(1)],
+            ),
+            (
+                "release or key change onto another monitor from home",
+                Home,
+                ReleaseAt {
+                    monitor: 1,
+                    configured: false,
+                },
+                landing(1, &[]),
+                vec![Create(1)],
+            ),
+            (
+                "configure after the release commits",
+                landing(1, &[2]),
+                Configured(1),
+                Home,
+                vec![Present(1), Destroy(2), Commit(1)],
+            ),
+            (
+                "another traveller's configure while landing",
+                landing(1, &[2]),
+                Configured(2),
+                landing(1, &[2]),
+                vec![Present(2)],
+            ),
+            (
+                "configure of a traveller during the drag",
+                Straddling(vec![1]),
+                Configured(1),
+                Straddling(vec![1]),
+                vec![Present(1)],
+            ),
+            (
+                "configure of an unknown monitor during the drag",
+                Straddling(vec![1]),
+                Configured(2),
+                Straddling(vec![1]),
+                vec![],
+            ),
+            (
+                "configure of an unknown monitor while landing",
+                landing(1, &[2]),
+                Configured(3),
+                landing(1, &[2]),
+                vec![],
+            ),
+            (
+                "release on home while landing",
+                landing(1, &[2]),
+                ReleaseHome,
+                landing(1, &[2]),
+                vec![],
+            ),
+            (
+                "release elsewhere while landing",
+                landing(1, &[]),
+                ReleaseAt {
+                    monitor: 2,
+                    configured: false,
+                },
+                landing(1, &[]),
+                vec![],
+            ),
+            ("hide from home", Home, TearDown, Home, vec![]),
+            (
+                "hide during a drag",
+                Straddling(vec![1, 2]),
+                TearDown,
+                Home,
+                vec![Destroy(1), Destroy(2)],
+            ),
+            (
+                "hide while landing",
+                landing(1, &[2]),
+                TearDown,
+                Home,
+                vec![Destroy(1), Destroy(2)],
             ),
         ];
-        for (name, start, offset, others, usable, want) in cases {
-            let start = Point {
-                x: start.0,
-                y: start.1,
-            };
-            let want = Point {
-                x: want.0,
-                y: want.1,
-            };
-            let got = drag_position(start, offset, size, others, usable, 10);
-            assert_eq!(got, want, "{name}");
+        for (name, state, event, next, actions) in cases {
+            assert_eq!(surface_step(&state, event), (next, actions), "{name}");
         }
     }
 

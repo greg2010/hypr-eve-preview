@@ -13,7 +13,8 @@ pub struct Color {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    pub output: String,
+    /// The monitor new thumbnails start on. `None` means the focused monitor at start.
+    pub output: Option<String>,
     pub thumbnail: Thumbnail,
     pub placement: Placement,
     pub border: Border,
@@ -89,7 +90,7 @@ const DEFAULT_COLOR: Color = Color {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            output: "DP-3".to_string(),
+            output: None,
             thumbnail: Thumbnail {
                 width: 480,
                 min_width: 160,
@@ -237,7 +238,7 @@ fn walk(table: &toml::Table) -> Result<Walked, ConfigError> {
             let text = value
                 .as_str()
                 .ok_or_else(|| key_error("output", "expected string"))?;
-            walked.config.output = text.to_string();
+            walked.config.output = Some(text.to_string());
         } else if let Some((name, keys)) = TABLES.iter().find(|(n, _)| n == key) {
             let inner = value
                 .as_table()
@@ -300,7 +301,9 @@ fn validate(walked: Walked) -> Result<Config, ConfigError> {
         label_color,
     } = walked;
     let t = &config.thumbnail;
-    non_empty("output", &config.output)?;
+    if let Some(output) = &config.output {
+        non_empty("output", output)?;
+    }
     even("thumbnail.width", t.width)?;
     if t.width < t.min_width {
         return Err(key_error(
@@ -482,7 +485,7 @@ step = 16
     #[test]
     fn parse_cases() {
         let every_key = Config {
-            output: "HDMI-A-1".to_string(),
+            output: Some("HDMI-A-1".to_string()),
             thumbnail: Thumbnail {
                 width: 400,
                 min_width: 100,
@@ -520,7 +523,7 @@ step = 16
             resize: Resize { step: 16 },
         };
         let defaults = Config {
-            output: "DP-3".to_string(),
+            output: None,
             thumbnail: Thumbnail {
                 width: 480,
                 min_width: 160,
@@ -555,7 +558,14 @@ step = 16
         };
         let cases = [
             ("empty", "", defaults.clone()),
-            ("example", EXAMPLE, defaults),
+            (
+                "example",
+                EXAMPLE,
+                Config {
+                    output: Some("DP-3".to_string()),
+                    ..defaults
+                },
+            ),
             ("every key", EVERY_KEY, every_key),
             (
                 "one key keeps the rest",
@@ -904,7 +914,7 @@ step = 16
             ..Config::default()
         };
         let named = Config {
-            output: "HDMI-A-1".to_string(),
+            output: Some("HDMI-A-1".to_string()),
             ..Config::default()
         };
         let cases: Vec<LoadCase> = vec![

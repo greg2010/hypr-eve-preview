@@ -73,6 +73,11 @@ pub enum Line {
         address: u64,
         error: String,
     },
+    WindowSkipped {
+        address: u64,
+        pid: i32,
+        error: String,
+    },
     Title {
         address: u64,
         label: String,
@@ -268,6 +273,15 @@ impl fmt::Display for Line {
             Line::Account { address, error } => {
                 write!(f, "account address=0x{address:x} error={}", json(error)?)
             }
+            Line::WindowSkipped {
+                address,
+                pid,
+                error,
+            } => write!(
+                f,
+                "window-skipped address=0x{address:x} pid={pid} error={}",
+                json(error)?
+            ),
             Line::Title {
                 address,
                 label,
@@ -719,6 +733,36 @@ mod tests {
                 },
                 Default,
                 "account address=0xabc error=\"bad \\\"x\\\"\"",
+            ),
+            (
+                "window skipped",
+                Line::WindowSkipped {
+                    address: 0x555512345678,
+                    pid: 4000,
+                    error: "permission denied".into(),
+                },
+                Default,
+                "window-skipped address=0x555512345678 pid=4000 error=\"permission denied\"",
+            ),
+            (
+                "window skipped without a pid",
+                Line::WindowSkipped {
+                    address: 0xabc,
+                    pid: 0,
+                    error: "no pid".into(),
+                },
+                Default,
+                "window-skipped address=0xabc pid=0 error=\"no pid\"",
+            ),
+            (
+                "window skipped escapes quotes",
+                Line::WindowSkipped {
+                    address: 0xabc,
+                    pid: -1,
+                    error: "bad \"x\"".into(),
+                },
+                Default,
+                "window-skipped address=0xabc pid=-1 error=\"bad \\\"x\\\"\"",
             ),
             (
                 "title",

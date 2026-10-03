@@ -2,22 +2,23 @@
 
 ## What it does
 
-`hypr-eve-preview` shows a live thumbnail of every EVE Online game client on one output (default `DP-3`), above all windows on every workspace. It runs on Hyprland.
+`hypr-eve-preview` shows a live thumbnail of every EVE Online game client on any monitor, above all windows on every workspace. It runs on Hyprland.
 
-- A game client is a window of class `steam_app_8500` whose title is `EVE` or starts with `EVE - `. The launcher and helper windows are not tracked.
+- A game client is a window started by the EVE launcher (its command line carries `/LauncherData=`) whose title is `EVE` or starts with `EVE - `. The launcher and helper windows are not tracked.
 - Each thumbnail has a label (the character name, else the `EVE<n>` workspace name, else `EVE`) and, on the focused client, a border ring.
-- A left click switches the output to the client's workspace.
-- A left drag moves a thumbnail. A left drag on its bottom-right 16 x 16 logical px grip, or the scroll wheel over the thumbnail, resizes it. The aspect ratio stays locked.
-- While snapping is on, a dragged thumbnail snaps to the usable area's edges and to the edges of other thumbnails within `thumbnail.snap_distance` logical px.
+- A left click switches to the client's workspace.
+- A thumbnail starts on the monitor its saved layout entry names, else on the default monitor: the one `output` names, else the one focused at startup.
+- A left drag moves a thumbnail. The thumbnail shows wherever its rectangle overlaps a monitor's usable area, at the same logical size, its label and ring drawn at each monitor's scale; a release on a monitor keeps it there, and the width may be capped to that monitor's usable width at the release. A left drag on its bottom-right 16 x 16 logical px grip, or the scroll wheel over the thumbnail, resizes it. The aspect ratio stays locked.
+- While snapping is on, a dragged thumbnail snaps to the edges of its monitor's usable area and of the other thumbnails on that monitor within `thumbnail.snap_distance` logical px.
 - One global lock stops moving and resizing. A click still switches the workspace.
 - Every thumbnail has one base opacity, `thumbnail.opacity` until set at runtime. A thumbnail under the pointer is fully opaque.
 - Hide removes every thumbnail until show. The state is runtime only and the tool starts visible.
 - Lock, hide, snapping and opacity are runtime switches. The tray menu and the control socket set them.
 - A command form (`lock`, `opacity <N>` and eight more) sends one command to the running daemon.
-- Position, width, the lock, snapping and opacity are saved in the layout file. Position and width are per EVE account.
+- Position, width, monitor, the lock, snapping and opacity are saved in the layout file. Position, width and monitor are per EVE account.
 - Clients appear and disappear as Hyprland's event socket reports them. A config change needs a restart.
 
-The tool supports one output only and does not reconnect to Hyprland: it exits instead. It reads no keyboard input.
+The tool reads the set of monitors once at startup and does not follow monitor hotplug. It does not reconnect to Hyprland: it exits instead. It reads no keyboard input.
 
 ## Command line
 
@@ -125,9 +126,9 @@ bind = SUPER SHIFT, H, exec, hypr-eve-preview toggle-hide
 
 - `exec-once` children have stdout and stderr on `/dev/null` and a `PATH` without `~/.cargo/bin`. Use an absolute path and `--log` to keep the report lines.
 - `cd packaging/arch && makepkg -si` builds the checkout and installs `/usr/bin/hypr-eve-preview` and this document under `/usr/share/doc/hypr-eve-preview/`.
-- The `layerrule` stops Hyprland from animating thumbnail moves while dragging. It also stops the fade when thumbnails hide and show.
+- The `layerrule` stops Hyprland from animating thumbnail moves while dragging. It also stops the fade when thumbnails hide and show. Without it the daemon still runs, but a dragged thumbnail trails the pointer.
 - The `bind` line is an example. Hyprland exports `HYPRLAND_INSTANCE_SIGNATURE` to the programs it starts, so the command form finds the socket.
-- Default-placed thumbnails are ordered by slot. A client on a workspace named `EVE<n>` (n from 1 to 12) has slot n. `eve-workspaces.sh` puts each client on its `EVE<n>` workspace. Without it clients still get thumbnails, with no slot.
+- Default-placed thumbnails are ordered by slot. A client on a workspace named `EVE<n>` (n from 1 to 12) has slot n. A client on any other workspace has no slot and is placed after the slotted ones.
 
 ## Config file
 
@@ -135,7 +136,7 @@ TOML. Every key is optional. An unknown key, a wrong type, an integer outside 0 
 
 | Key | Type | Default | Rule |
 |---|---|---|---|
-| `output` | string | `DP-3` | Non-empty. The Hyprland monitor and `wl_output` name. |
+| `output` | string | the monitor focused at startup | Non-empty. The Hyprland monitor and `wl_output` name of the default monitor, where a thumbnail starts unless its saved entry names a monitor present at startup. |
 | `thumbnail.width` | integer | 480 | Even. `min_width` to `max_width`. |
 | `thumbnail.min_width` | integer | 160 | Even, at least 2. |
 | `thumbnail.max_width` | integer | 1280 | Even, at least `min_width`. |
@@ -160,7 +161,7 @@ Dotted keys are TOML tables, so `[thumbnail]` with `opacity = 50` and `thumbnail
 
 `$XDG_STATE_HOME/hypr-eve-preview/layout.json`. `XDG_STATE_HOME` counts when it is set, non-empty and absolute. Otherwise `$HOME/.local/state` is used.
 
-- One JSON object. Each key is `locked`, `snapping`, `opacity` or an account key (`user:<id>` or `character:<name>`). Each account value has exactly `x`, `y` and `width`, in logical px, with the position relative to the usable area's origin.
+- One JSON object. Each key is `locked`, `snapping`, `opacity` or an account key (`user:<id>` or `character:<name>`). Each account value has exactly `x`, `y` and `width`, in logical px, and an optional `output`, the monitor name, with the position relative to the origin of that monitor's usable area. Every save writes `output`. An entry without `output`, or naming a monitor absent at startup, loads on the default monitor.
 - A save writes the keys in the order `locked`, `snapping`, `opacity`, then the account entries.
 
 | Key | Value | When absent | Written |
@@ -173,10 +174,10 @@ Dotted keys are TOML tables, so `[thumbnail]` with `opacity = 50` and `thumbnail
 - Writers: the end of a drag, the end of a grip resize, a wheel step, a key change of a user-placed client, and a lock, snapping or opacity change. Account entries are written only for a client that has an account key. Entries of accounts that are not running stay.
 - At most one write per 500 ms while running; a save still pending at exit is written at once. The write goes to `layout.json.tmp` in the same directory, then is renamed over `layout.json`. The directory is created with mode 0700.
 - Startup never writes the file. An unreadable, malformed or invalid file is renamed to `layout.json.bad` (replacing an older one), a `layout-error` line reports it, and the layout starts empty, unlocked, with snapping on and no `opacity`. If the rename fails the tool exits 1.
-- Account key sources, in order: the user id decoded from the client's `/LauncherData=` command-line argument, then the character name from the latest title, then none (default placement, nothing saved).
+- Account key sources, in order: the user id decoded from the client's `/LauncherData=` command-line argument, then the character name from the latest title that carries one, then none (default placement, nothing saved).
 
 ```json
-{"locked": false, "snapping": true, "opacity": 80, "user:1000001": {"x": 8, "y": 8, "width": 480}}
+{"locked": false, "snapping": true, "opacity": 80, "user:1000001": {"x": 8, "y": 8, "width": 480, "output": "HDMI-A-1"}}
 ```
 
 ## Tray
@@ -226,8 +227,9 @@ The command form prints nothing on `ok`, only an `exit` line on a failure, and a
 
 | Class | Level | When | Fields in print order |
 |---|---|---|---|
-| `start` | default | Once, after the setup reads. | `output`, `scale`, `usable=<x>,<y>,<w>x<h>`, `mode` (`recommit` or `ignore-damage`), `config` (`<json path>` or `-`), `layout`, `locked=<true or false>`, `font` (`<json path>`) |
-| `account` | default | The user id lookup fails, before that client's `client-added` line. | `address`, `error=<json>` |
+| `start` | default | Once, after the setup reads. | `output`, `scale`, `usable=<x>,<y>,<w>x<h>` (the default monitor's name, scale and usable area), `mode` (`recommit` or `ignore-damage`), `config` (`<json path>` or `-`), `layout`, `locked=<true or false>`, `font` (`<json path>`) |
+| `account` | default | A client's `/LauncherData=` argument gives no user id, so it is tracked without a user id; its key is the character name from its latest title that carries one, or none until the title carries one (before that client's `client-added` line). | `address`, `error=<json>` |
+| `window-skipped` | default | A window with a game title has a pid of 0 or below, or a command line that cannot be read. It is not tracked. | `address`, `pid`, `error=<json>` |
 | `client-added` | default | A game client is tracked. | `address`, `pid`, `workspace=<json>`, `slot` (`<n>` or `-`), `account` (`<json key>` or `-`), `label=<json>` |
 | `client-removed` | default | A tracked or pending client leaves. The reason is `closed`, `title <json title>`, `not listed by j/clients` or a capture failure. A pending client (its `j/clients` lookup unanswered) leaves with `closed` or `not listed by j/clients`, without an earlier `client-added`. | `address`, `reason=<json>` |
 | `title` | default | A tracked client's title changes and is still a game title. | `address`, `label=<json>`, `account` |
@@ -260,7 +262,7 @@ The command form prints nothing on `ok`, only an `exit` line on a failure, and a
 | Code | Cause |
 |---|---|
 | 0 | SIGINT, SIGTERM, `--seconds` elapsed, or the tray `Quit` item. |
-| 1 | Runtime failure: no default config or state path, log file failure, layout rename failure, `fc-match` failure, missing `XDG_RUNTIME_DIR` or `HYPRLAND_INSTANCE_SIGNATURE`, Hyprland event socket connect error, EOF or read error, a failed or unparsable `j/monitors`, `j/clients` or `j/activewindow` request, missing output or Wayland global, no render node, a `gbm_create_device` failure, no `linux_dmabuf` event before `buffer_done`, unknown fourcc, empty modifier list, buffer allocation or import failure, overlay closed by the compositor, a chrome input region, shm pool or shm buffer failure, a refused `Buffer::attach_to` of the chrome buffer, a pointer call error (`get_pointer_with_theme`, `get_relative_pointer`, `set_cursor`), executor out of step (`<action>: no frame, overlay or buffer for the slot`, where the action is `copy`, `recommit` or `present`), Wayland connection or protocol error, an event-loop error (building the loop or the `Signals` source, inserting or re-enabling a source or timer other than a control connection's or the tray's, or a failed dispatch with no Wayland error), a failed teardown step, another daemon answering on the control socket, a control socket probe, removal or bind failure, a missing `wp_alpha_modifier_v1` global. A tray failure is never a cause. |
+| 1 | Runtime failure: no default config or state path, log file failure, layout rename failure, `fc-match` failure, missing `XDG_RUNTIME_DIR` or `HYPRLAND_INSTANCE_SIGNATURE`, Hyprland event socket connect error, EOF or read error, a failed or unparsable `j/monitors`, `j/clients` or `j/activewindow` request, no default monitor in `j/monitors` (`no monitor named <name> in j/monitors`; with `output` unset, `no focused monitor in j/monitors`), no `wl_output` for the default monitor at startup or for a monitor a surface is created on (`no wl_output named <name>`), a missing Wayland global, no render node, a `gbm_create_device` failure, no `linux_dmabuf` event before `buffer_done`, unknown fourcc, empty modifier list, buffer allocation or import failure, overlay closed by the compositor, a chrome input region, shm pool or shm buffer failure, a refused `Buffer::attach_to` of the chrome buffer, a pointer call error (`get_pointer_with_theme`, `get_relative_pointer`, `set_cursor`), executor out of step (`<action>: no frame, overlay or buffer for the slot`, where the action is `copy`, `recommit` or `present`), Wayland connection or protocol error, an event-loop error (building the loop or the `Signals` source, inserting or re-enabling a source or timer other than a control connection's or the tray's, or a failed dispatch with no Wayland error), a failed teardown step, another daemon answering on the control socket, a control socket probe, removal or bind failure, a missing `wp_alpha_modifier_v1` global. A tray failure is never a cause. |
 | 2 | Usage error, or config error (unreadable or malformed file, unknown key, wrong type, value out of range, missing `--config` file, bad `label.font_file`, an out-of-range `thumbnail.opacity`). |
 
 The command form exits 0, 1 or 2 as the command-line table lists.
@@ -272,6 +274,6 @@ If a report line cannot be written, the tool exits 1 without an `exit` line.
 - It never focuses, moves, resizes or closes a window and never edits Hyprland config.
 - The only dispatcher it sends is `workspace name:<ws>`, once per click. The only other Hyprland requests are `j/monitors`, `j/clients` and `j/activewindow`.
 - The only subprocess is `fc-match`, run at most once at startup.
-- It reads `/proc/<pid>/cmdline` of a game client once, to find the user id, and no other file under `/proc/<pid>/`. Nothing from a command line is printed or saved except the decoded decimal user id inside an account key.
+- It reads `/proc/<pid>/cmdline` at most once each time a window with a game title appears (startup snapshot or `openwindow`), to identify the client and find the user id, and no other file under `/proc/<pid>/`. Nothing from a command line is printed or saved except the decoded decimal user id inside an account key.
 - It does not read captured pixels on the CPU.
 - It listens on one Unix socket in Hyprland's instance directory, and owns one session-bus name. Neither exposes client data. The socket accepts only the ten commands. The only state-changing bus method is a click on `Lock thumbnails`, `Hide thumbnails`, `Snap thumbnails`, an opacity step or `Quit`.

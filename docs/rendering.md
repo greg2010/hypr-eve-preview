@@ -13,6 +13,7 @@ Every client has its own thumbnail. There is no shared canvas, and no client wai
 | Layer surface with a `wp_viewport` and a `wp_alpha_modifier_surface_v1` | shows one dmabuf buffer, scaled to the thumbnail size, at the image opacity |
 | Two dmabuf buffers, each a GBM buffer object and its `wl_buffer` | copy targets; at most one is on screen |
 | Chrome subsurface at (0, 0) with a `wp_viewport` and an shm pool | ring and label |
+| While the thumbnail touches other monitors: one more layer surface with its own subsurface per monitor, a traveller | takes the same frames and chrome as the first surface; Hyprland keeps pointer focus on the pressed surface only while a window has keyboard focus, and with none the drag ends when the cursor leaves the thumbnail (`overlay`) |
 | `Capture` machine and one capture timer | frame and buffer state, pacing, failure count |
 
 ```mermaid
@@ -46,7 +47,7 @@ sequenceDiagram
 4. **Later frames.** A description whose size or fourcc does not match the target buffer destroys and reallocates that buffer only, and the copy waits for its `created`. The other buffer follows when it is next the target.
 5. **Copy.** It starts when the layer surface has had its first configure, the target buffer is imported at the frame's size and fourcc, and the target is free. `main` sends `copy(wl_buffer, ignore_damage)`. In recommit mode, with a buffer on screen, `main` then re-attaches that buffer on the layer surface with full damage and commits. The capture timer becomes the 1 s stall deadline.
 6. **Ready.** `flags` sets `y_invert`, which each request clears, so a frame without `flags` is upright. `ready` makes the target the on-screen buffer and the previous one displaced, resets the failure count and prints `ready`.
-7. **Present.** When the thumbnail has no chrome yet or its size changed, the chrome is drawn and committed on the subsurface first; the subsurface is synchronized, so its content waits for the layer commit. Then on the layer surface, in this order: buffer transform `flipped_180` for `y_invert`, else `normal`; `attach(wl_buffer, 0, 0)`; viewport source the whole buffer, destination the thumbnail size; layer size and margins when the size changed; `damage_buffer` over the whole buffer; `commit`. That one commit applies the image, the chrome, a pending alpha factor and the geometry together. The export frame is destroyed after it, and the next wake is armed.
+7. **Present.** When the thumbnail has no chrome yet or its size changed, the chrome is drawn and committed on the subsurface first; the subsurface is synchronized, so its content waits for the layer commit. Then on the layer surface, in this order: buffer transform `flipped_180` for `y_invert`, else `normal`; `attach(wl_buffer, 0, 0)`; viewport source the whole buffer, destination the thumbnail size; layer size and margins when the size changed; `damage_buffer` over the whole buffer; `commit`. That one commit applies the image, the chrome, a pending alpha factor and the geometry together. The export frame is destroyed after it, and the next wake is armed. Every configured surface of the thumbnail gets the same buffer and the same present; each has its chrome drawn at its monitor's scale (`overlay`).
 8. **Release.** Hyprland sends `wl_buffer.release` for the displaced buffer when it no longer reads it, which frees the buffer.
 
 ### Opacity
@@ -65,6 +66,7 @@ sequenceDiagram
 | A recommit-mode copy with a buffer on screen | the on-screen buffer re-attached, full damage, commit | none |
 | Resize (grip, wheel, account key change) | size, viewport destination and margins, one commit; no attach | drawn at the new size first |
 | Move (drag, default-row change) | margins, commit; no attach | none |
+| A dragged thumbnail reaching or leaving a monitor | a traveller created there, or destroyed (`overlay`) | drawn on a new traveller |
 | Ring owner change (old and new owner), label change | commit | redrawn |
 | Hover change of p | `set_multiplier`; commit when chromed | redrawn when chromed |
 | Base opacity change, each non-hovered overlay | `set_multiplier`; commit when chromed | redrawn when chromed |
@@ -79,7 +81,7 @@ No surface asks for frame callbacks. Each client paces itself on its capture tim
 - One frame is in flight per client; the next request waits for `ready` or the failure path.
 - The next request is due at the later of the last copy + 33.333334 ms and the last failure + 500 ms. `ready` and a failure arm a wake for that instant; an early wake re-arms it.
 - A due request whose target buffer is still displaced opens a release wait (`release-wait`) and arms nothing. The release ends it (`released`) and the request goes out at once.
-- Damage modes: the first copy, and any retry before the first `ready`, uses `ignore_damage=1`. After that, recommit mode (the default) copies with `ignore_damage=0` and re-commits the on-screen buffer; `--ignore-damage` keeps `ignore_damage=1` and never re-commits. Hyprland performs a pending copy at a commit of the captured window's monitor, and `ignore_damage=1` damages that monitor. The re-commit damages only the thumbnail, so it drives the copy only when that monitor is the configured output; an EVE window on another monitor waits for its own monitor's commit.
+- Damage modes: the first copy, and any retry before the first `ready`, uses `ignore_damage=1`. After that, recommit mode (the default) copies with `ignore_damage=0` and re-commits the on-screen buffer; `--ignore-damage` keeps `ignore_damage=1` and never re-commits. Hyprland performs a pending copy at a commit of the captured window's monitor, and `ignore_damage=1` damages that monitor. The re-commit damages only the thumbnail, so it drives the copy only when the thumbnail is on the captured window's monitor; otherwise the copy waits for that monitor's own commit.
 
 ### Failure path
 
@@ -92,7 +94,7 @@ No surface asks for frame callbacks. Each client paces itself on its capture tim
 | `linux_dmabuf` with a zero dimension | `Remove` | destroyed, if it existed | `client-removed` |
 | `buffer_done` without `linux_dmabuf` | exit 1 | | `exit` |
 | A `dmabuf` error: unknown fourcc, no modifier, GBM allocation, plane fd, or `failed` of a current import | exit 1 | | `exit` |
-| Chrome input region, pool, buffer or attach error; no configured output; layer `closed` | exit 1 | | `exit` |
+| Chrome input region, pool, buffer or attach error; no `wl_output` for the monitor a surface is created on (`no wl_output named <name>`); layer `closed` | exit 1 | | `exit` |
 | The capture timer cannot join the event loop (`event loop: <error>`); the dmabuf params object cannot be created | exit 1 | | `exit` |
 | An action whose frame, overlay or buffer is missing | exit 1 | | `exit` |
 
@@ -143,7 +145,7 @@ A `Released` for a buffer in any state but Displaced is ignored. A reallocation 
 
 **State.** The label `Font`, parsed once at startup from `label.font_file`, else from the file that one `fc-match -f '%{file}' <label.font>` run prints. Rendering keeps nothing between draws.
 
-**How.** `render` fills a canvas whose size is the thumbnail's logical size × the output scale from `j/monitors`, each axis rounded. The viewport maps it back to the logical size, so the chrome is drawn at device pixels.
+**How.** `render` fills a canvas whose size is the thumbnail's logical size × the scale of the surface's monitor from `j/monitors`, each axis rounded. The viewport maps it back to the logical size, so the chrome is drawn at device pixels.
 
 1. Every byte is set to 0.
 2. Ring, when the client owns the ring and `border.width` > 0: every pixel within r = ⌊scale × width + 0.5⌋ of an edge gets the premultiplied ring colour.
@@ -157,18 +159,19 @@ Pixels are premultiplied, bytes B, G, R, A (`wl_shm` ARGB8888), each channel ⌊
 
 ### `overlay`
 
-**State.** One `Overlay` per thumbnail: the layer surface and its viewport, the alpha object, the chrome subsurface, its surface and viewport, the shm `SlotPool`, the current chrome buffer, the size, the position and the configured flag.
+**State.** One `Overlay` per thumbnail, and one more per other monitor it touches: the layer surface and its viewport, the alpha object, the chrome subsurface, its surface and viewport, the shm `SlotPool`, the current chrome buffer, the size, the position (signed margins), the configured flag and whether a frame buffer is attached.
 
 **How.**
-- **Creation, in this order.** `wl_surface`; layer surface on layer `overlay`, namespace `hypr-eve-preview`, on the configured output, anchored top and left, margins (y, 0, 0, x), exclusive zone 0 (so the compositor keeps it clear of reserved areas and positions are relative to the usable area), no keyboard, size the thumbnail size; chrome subsurface at (0, 0), its input region set empty so the pointer always lands on the layer surface; chrome viewport; shm pool sized for one logical-size canvas; layer viewport; alpha object with the initial multiplier; one buffer-less layer commit. The layer surface's input region is never set, so it is the whole surface.
-- **Configure.** sctk acknowledges every configure. The first one marks the overlay configured and feeds `OverlayConfigured`; later ones change nothing. The configured size is ignored: the daemon sets the size itself.
+- **Creation, in this order.** `wl_surface`; layer surface on layer `overlay`, namespace `hypr-eve-preview`, on the `wl_output` of its monitor, anchored top and left, margins (y, 0, 0, x), exclusive zone 0 (so the compositor keeps it clear of reserved areas and positions are relative to the usable area), no keyboard, size the thumbnail size; chrome subsurface at (0, 0), its input region set empty so the pointer always lands on the layer surface; chrome viewport; shm pool sized for one logical-size canvas; layer viewport; alpha object with the initial multiplier; one buffer-less layer commit. The layer surface's input region is never set, so it is the whole surface.
+- **Configure.** sctk acknowledges every configure. The first one marks the overlay configured; later ones change nothing. The record's first overlay then feeds `OverlayConfigured`. A traveller presents the last presented buffer, when there is one, feeds nothing, and takes over when it is the landing surface. The configured size is ignored: the daemon sets the size itself.
 - **Chrome draw.** Each draw takes a new pool buffer, renders into it, sets the chrome viewport destination to the logical size, attaches it at (0, 0), damages the whole buffer and commits the chrome surface. The previous chrome buffer is dropped: sctk destroys it at once if the compositor no longer holds it, else at its release, and its pool buffer becomes free only then. The pool grows when no free pool buffer fits.
 - **Layer requests.** `present` (the order in step 7 above), `recommit` (attach the on-screen buffer, full damage, commit; nothing else), `move_to` (margins, commit), `resize` (size, viewport destination, margins, one commit), `set_alpha` (multiplier only; the next layer commit applies it), `commit` (applies a chrome-only redraw).
-- **Destroy, in this order.** Alpha object; chrome viewport, subsurface and surface; chrome buffer (at once, or at its release while the compositor holds it) and pool; layer viewport; layer role, then its `wl_surface` (sctk's order).
+- **One surface per monitor.** A dragged thumbnail has one surface on every monitor it touches, each at the same layout position (margins may be negative), each receiving every present, recommit, chrome draw and alpha change; its chrome is drawn at its monitor's scale. A surface created by a drag or at the drop starts at the full alpha factor, one created by a key change at the record's current opacity (the base opacity, or full while the thumbnail is hovered); the chrome is drawn at once, and presents the last presented buffer at its configure, before anything else is attached. A surface whose monitor the thumbnail no longer touches is destroyed at once. At the drop the surface on the landing monitor stays and the others are destroyed; a landing surface not yet configured takes over at its configure, after it presents the last presented buffer. A key change that moves the record to another monitor works the same way, with one surface created there.
+- **Destroy, in this order.** Alpha object; chrome viewport, subsurface and surface; chrome buffer (at once, or at its release while the compositor holds it) and pool; layer viewport; layer role, then its `wl_surface` (sctk's order). Teardown and shutdown destroy every surface of a thumbnail before its buffers.
 
 **Boundary.** Only `main` calls it. In: the dmabuf `wl_buffer`s, buffer and thumbnail sizes, positions, `y_invert`, alpha factors, and a draw callback that runs `chrome`. Out: surface requests to the compositor, and the layer `wl_surface` that `main` uses to route pointer events and configures to the client.
 
-**Failure.** `OverlayError` (input region, pool, chrome buffer, chrome attach) exits 1. A layer `closed` event exits 1 with `overlay closed by compositor`. A missing configured output at creation exits 1.
+**Failure.** `OverlayError` (input region, pool, chrome buffer, chrome attach) exits 1. A layer `closed` event exits 1 with `overlay closed by compositor`. A monitor without a `wl_output` at creation exits 1 with `no wl_output named <name>`.
 
 ### `protocol`
 
@@ -176,7 +179,7 @@ wayland-scanner generates client bindings at build time from the in-tree hyprlan
 
 ## Invariants
 
-- A layer surface gets a buffer only after its first configure: present follows a copy, and a copy waits for `OverlayConfigured`. Hyprland raises a protocol error for a buffer on an unconfigured layer surface.
+- A layer surface gets a buffer only after its first configure: present follows a copy, a copy waits for `OverlayConfigured`, and the last presented buffer goes to a new surface only once that surface is configured. Hyprland raises a protocol error for a buffer on an unconfigured layer surface.
 - Every attach on a layer surface is followed by its commit before the next attach; moves and resizes never attach.
 - One alpha object per overlay, created before the first commit: a second `get_surface` on the same surface is a protocol error.
 - The alpha factor and the chrome alpha change on the same layer commit: the multiplier is double-buffered and the chrome subsurface is synchronized.
@@ -184,4 +187,4 @@ wayland-scanner generates client bindings at build time from the in-tree hyprlan
 - A buffer is reallocated only while it is free, so a reallocation never destroys a buffer that the compositor shows or reads.
 - At opacity 0 the chrome canvas is all zero; at opacity 100 the chrome colours are unscaled, because ⌊(a × 100 + 50) / 100⌋ = a.
 - A frame without `flags` presents upright: `y_invert` is cleared at each request.
-- The overlay and both buffer allocations come only from the absent overlay state of a `Capture`, which no input restores, so an overlay is created once per capture lifetime.
+- The record's first overlay and both buffer allocations come only from the absent overlay state of a `Capture`, which no input restores, so `capture` creates an overlay once per capture lifetime; every other overlay is a traveller, created by a drag, at the drop on the landing monitor, or by a key change that moves the record.
