@@ -2,7 +2,7 @@
 
 ## Scope
 
-Rendering turns each tracked client's window into a live thumbnail. Hyprland copies the window into GPU buffers through its toplevel export protocol, the compositor scales those buffers onto the thumbnail's layer surface, and a subsurface above it carries the ring and the label, drawn on the CPU. The modules are `capture` (the per-client frame and buffer state machine), `dmabuf` (the GBM device, the modifier choice and the import), `chrome` (ring and label pixels), `overlay` (one thumbnail's surfaces) and `protocol` (the generated Hyprland bindings); `main` executes their actions. For the whole-app view see [architecture.md](architecture.md).
+Rendering turns each tracked client's window into a live thumbnail. Hyprland copies the window into GPU buffers through its toplevel export protocol, the compositor scales those buffers onto the thumbnail's layer surface, and a subsurface above it carries the ring and the label, drawn on the CPU. The modules are `capture` (the per-client frame and buffer state machine), `dmabuf` (the GBM device, the modifier choice and the import), `chrome` (ring and label pixels), `overlay` (one thumbnail's surfaces) and `protocol` (the generated Hyprland bindings); `app` executes their actions. For the whole-app view see [architecture.md](architecture.md).
 
 ## From a window to pixels
 
@@ -19,7 +19,7 @@ Every client has its own thumbnail. There is no shared canvas, and no client wai
 ```mermaid
 sequenceDiagram
     participant C as capture
-    participant M as main
+    participant M as app
     participant H as Hyprland
     participant O as overlay
     C->>M: RequestFrame
@@ -41,18 +41,18 @@ sequenceDiagram
     M->>H: frame.destroy
 ```
 
-1. **Request.** `main` sends `capture_toplevel` with `overlay_cursor` 0 and the capture handle (the low 32 bits of the window address), then `wl_display.sync`. Both carry the client's address. Hyprland creates no frame object for a window it does not know, so a sync `done` before any frame event means the window is gone.
+1. **Request.** `app` sends `capture_toplevel` with `overlay_cursor` 0 and the capture handle (the low 32 bits of the window address), then `wl_display.sync`. Both carry the client's address. Hyprland creates no frame object for a window it does not know, so a sync `done` before any frame event means the window is gone.
 2. **Describe.** `linux_dmabuf` gives the fourcc and the size; `buffer_done` hands them to `capture`. The shm `buffer` event and the `damage` events are not used.
 3. **Surfaces and buffers.** At the first description `capture` asks for the overlay and for both buffers at the frame's fourcc and size. The thumbnail size is the client's width with the height from the buffer's aspect, rounded to even (`geometry`); the position comes from `layout`, the alpha factor from the effective opacity. `overlay` creates the surfaces and sends a buffer-less layer commit. Each buffer is a GBM buffer object with the `RENDERING` flag, on the render node the default dmabuf feedback names, allocated by `dmabuf` with the feedback's modifiers for that fourcc (tranche order, then index order; duplicates and `DRM_FORMAT_MOD_INVALID` removed). A `format` line prints, then one `zwp_linux_buffer_params_v1` takes from `dmabuf` an `add` per plane (each plane fd closes right after it) and `create(width, height, fourcc, 0)`. The `created` event delivers the buffer's `wl_buffer`.
 4. **Later frames.** A description whose size or fourcc does not match the target buffer destroys and reallocates that buffer only, and the copy waits for its `created`. The other buffer follows when it is next the target.
-5. **Copy.** It starts when the layer surface has had its first configure, the target buffer is imported at the frame's size and fourcc, and the target is free. `main` sends `copy(wl_buffer, ignore_damage)`. In recommit mode, with a buffer on screen, `main` then re-attaches that buffer on the layer surface with full damage and commits. The capture timer becomes the 1 s stall deadline.
+5. **Copy.** It starts when the layer surface has had its first configure, the target buffer is imported at the frame's size and fourcc, and the target is free. `app` sends `copy(wl_buffer, ignore_damage)`. In recommit mode, with a buffer on screen, `app` then re-attaches that buffer on the layer surface with full damage and commits. The capture timer becomes the 1 s stall deadline.
 6. **Ready.** `flags` sets `y_invert`, which each request clears, so a frame without `flags` is upright. `ready` makes the target the on-screen buffer and the previous one displaced, resets the failure count and prints `ready`.
 7. **Present.** When the thumbnail has no chrome yet or its size changed, the chrome is drawn and committed on the subsurface first; the subsurface is synchronized, so its content waits for the layer commit. Then on the layer surface, in this order: buffer transform `flipped_180` for `y_invert`, else `normal`; `attach(wl_buffer, 0, 0)`; viewport source the whole buffer, destination the thumbnail size; layer size and margins when the size changed; `damage_buffer` over the whole buffer; `commit`. That one commit applies the image, the chrome, a pending alpha factor and the geometry together. The export frame is destroyed after it, and the next wake is armed. Every configured surface of the thumbnail gets the same buffer and the same present; each has its chrome drawn at its monitor's scale (`overlay`).
 8. **Release.** Hyprland sends `wl_buffer.release` for the displaced buffer when it no longer reads it, which frees the buffer.
 
 ### Opacity
 
-- The effective opacity p is 100 while the pointer is on the thumbnail, otherwise the base opacity (`main`'s `base_opacity`). A thumbnail takes the base again when the pointer leaves.
+- The effective opacity p is 100 while the pointer is on the thumbnail, otherwise the base opacity (`app`'s `base_opacity`). A thumbnail takes the base again when the pointer leaves.
 - Image: the layer surface's multiplier is ⌊`u32::MAX` × p / 100⌋ in 64-bit arithmetic. It is double-buffered and acts on the layer surface only, not on the chrome subsurface.
 - Chrome: `chrome` scales the alpha of the ring and label colours to ⌊(a × p + 50) / 100⌋, so a half rounds up, before it premultiplies. At 100 the colours are unchanged; at 0 every canvas byte is 0.
 - A hover change that alters p sends `set_multiplier`. A thumbnail that already has chrome redraws it and sends one layer commit, so image and chrome change together; without chrome, the first present's commit applies the factor.
@@ -89,7 +89,7 @@ No surface asks for frame callbacks. Each client paces itself on its capture tim
 |---|---|---|---|
 | `failed` in any state after the request | frame destroyed, a copying buffer freed, count + 1, retry at the pacing instant | the last presented image; nothing before the first `ready` | `failed reason=failed` |
 | No `ready` or `failed` 1 s after `copy` (stall) | as `failed` | as above | `failed reason=stall` |
-| Fifth consecutive failure | `Remove`: `clients` drops the client, `main` runs the teardown plan | destroyed | `failed`, `client-removed` |
+| Fifth consecutive failure | `Remove`: `clients` drops the client, `app` runs the teardown plan | destroyed | `failed`, `client-removed` |
 | Sync `done` before any frame event | `Remove`; the frame is dropped without a destroy | destroyed, if it existed | `client-removed` |
 | `linux_dmabuf` with a zero dimension | `Remove` | destroyed, if it existed | `client-removed` |
 | `buffer_done` without `linux_dmabuf` | exit 1 | | `exit` |
@@ -106,7 +106,7 @@ A `ready` resets the count. A `failed` that arrives while the machine is idle is
 
 **State.** One `Capture` per client: the damage mode, the address and handle, the frame state, two buffer states, the overlay state (absent, or created with a configured flag and per buffer its size, fourcc and imported flag), the attempt number, the consecutive failure count, the last copy and last failure instants, an open release wait, and `y_invert`.
 
-**How.** A pure machine. `handle` takes an input and the current instant from `main` and returns an ordered action list; it does no I/O and reads no clock. The target is the buffer after the on-screen one, buffer 0 when none is on screen.
+**How.** A pure machine. `handle` takes an input and the current instant from `app` and returns an ordered action list; it does no I/O and reads no clock. The target is the buffer after the on-screen one, buffer 0 when none is on screen.
 
 | Frame state | Next | On |
 |---|---|---|
@@ -127,19 +127,19 @@ A `Released` for a buffer in any state but Displaced is ignored. A reallocation 
 
 `teardown` turns what a client holds into the ordered plan: cancel the timer; destroy the frame if it has had an event, else make it an orphan; destroy the overlay; destroy each buffer (`dmabuf` destroys its `wl_buffer`, then its buffer object); mark the client's pending imports superseded. Client removal and hide run it.
 
-**Boundary.** In, from `main`: `Start` (client added, show), `Wake` (capture timer), `FrameDescribed`, `Flags`, `Ready` and `Failed` (export frame events), `FrameMissing` (a sync `done` before any event), `OverlayConfigured` (first layer configure), `Imported` (`created`), `Released` (`wl_buffer.release`). Out, executed by `main` in order: `RequestFrame`, `CreateOverlay` (to `overlay`), `Allocate` (to `dmabuf` and the import list), `Copy`, `Recommit` and `Present` (export frame and `overlay`), `DestroyFrame`, `WakeAt` (capture timer), `Report` (report lines), `Remove` (to `clients`), `Exit` (stop). `main` keeps a pending import listed per params object until its `created` or `failed`; one replaced by reallocation or released by teardown resolves as superseded, and its late `wl_buffer` or params are destroyed without a line.
+**Boundary.** In, from `app`: `Start` (client added, show), `Wake` (capture timer), `FrameDescribed`, `Flags`, `Ready` and `Failed` (export frame events), `FrameMissing` (a sync `done` before any event), `OverlayConfigured` (first layer configure), `Imported` (`created`), `Released` (`wl_buffer.release`). Out, executed by `app` in order: `RequestFrame`, `CreateOverlay` (to `overlay`), `Allocate` (to `dmabuf` and the import list), `Copy`, `Recommit` and `Present` (export frame and `overlay`), `DestroyFrame`, `WakeAt` (capture timer), `Report` (report lines), `Remove` (to `clients`), `Exit` (stop). `app` keeps a pending import listed per params object until its `created` or `failed`; one replaced by reallocation or released by teardown resolves as superseded, and its late `wl_buffer` or params are destroyed without a line.
 
-**Failure.** The failure path above: `Remove` for a missing window, a zero-size frame or the fifth consecutive failure; `Exit` for a description without `linux_dmabuf`. The `dmabuf` errors on an `Allocate` exit 1 in `main`.
+**Failure.** The failure path above: `Remove` for a missing window, a zero-size frame or the fifth consecutive failure; `Exit` for a description without `linux_dmabuf`. The `dmabuf` errors on an `Allocate` exit 1 in `app`.
 
 ### `dmabuf`
 
-**State.** The `Allocator`: the GBM device on the render node that the default dmabuf feedback names, opened at startup. Every buffer object is dropped before it; at exit `main` drops the buffers' and the pending imports' buffer objects first. Per buffer, `DmaBuffer` pairs the buffer object with the `wl_buffer` that `created` delivers.
+**State.** The `Allocator`: the GBM device on the render node that the default dmabuf feedback names, opened at startup. Every buffer object is dropped before it; at exit `app` drops the buffers' and the pending imports' buffer objects first. Per buffer, `DmaBuffer` pairs the buffer object with the `wl_buffer` that `created` delivers.
 
 **How.** `modifiers_for` chooses the modifier list for a fourcc from the feedback's format table (`FormatModifier` entries) and tranches. `Allocator::allocate` maps the fourcc to a GBM format and creates the buffer object with that list. `import` sends the `add`s and the `create` on a params object. `DmaBuffer::destroy` destroys the pair. `fourcc_text` writes a fourcc as its four characters, then in hex. The allocation and import rules are in step 3 above; the destroy order is in `capture`'s teardown plan.
 
-**Boundary.** Only `main` calls it; `report` uses `fourcc_text` for the `format` line. In: the feedback's main device, format table and tranches; a buffer's fourcc and size from `Allocate`; a params object from sctk's `DmabufState`. Out: the `Allocator`, the buffer object, the params object with its requests sent, `DmabufError`. Outside it, in `main`: the feedback probe, creating the params object, the `format` line, the pending import list with its `created` and `failed`, and the `release` routing. Which buffer is allocated, and when, is `capture`'s.
+**Boundary.** Only `app` calls it, and `exit` holds `DmabufError` in `SetupError`; `report` uses `fourcc_text` for the `format` line. In: the feedback's main device, format table and tranches; a buffer's fourcc and size from `Allocate`; a params object from sctk's `DmabufState`. Out: the `Allocator`, the buffer object, the params object with its requests sent, `DmabufError`. Outside it, in `app`: the feedback probe, creating the params object, the `format` line, the pending import list with its `created` and `failed`, and the `release` routing. Which buffer is allocated, and when, is `capture`'s.
 
-**Failure.** `DmabufError`, exit 1. At startup: the render node directory cannot be read, a render node cannot be inspected or opened, no render node has the main device's number, or GBM device creation fails. Later: the `dmabuf` row of the failure path above; `main` builds its `ImportFailed` from a current import's `failed`, with the fourcc and the modifiers it tried.
+**Failure.** `DmabufError`, exit 1. At startup: the render node directory cannot be read, a render node cannot be inspected or opened, no render node has the main device's number, or GBM device creation fails. Later: the `dmabuf` row of the failure path above; `app` builds its `ImportFailed` from a current import's `failed`, with the fourcc and the modifiers it tried.
 
 ### `chrome`
 
@@ -153,7 +153,7 @@ A `Released` for a buffer in any state but Displaced is ignored. A reallocation 
 
 Pixels are premultiplied, bytes B, G, R, A (`wl_shm` ARGB8888), each channel ⌊(c × a + 127) / 255⌋. Opacity scales the alpha before premultiplication (see Opacity).
 
-**Boundary.** In, from `main`: the label and ring owner (`clients`), the border and label style (`config`), the scale, the effective opacity, and the canvas of a new `overlay` pool buffer. Out: the canvas bytes.
+**Boundary.** In, from `app`: the label and ring owner (`clients`), the border and label style (`config`), the scale, the effective opacity, and the canvas of a new `overlay` pool buffer. Out: the canvas bytes.
 
 **Failure.** A draw cannot fail. At startup a `label.font_file` that cannot be read or parsed exits 2; a failed `fc-match`, or a file it prints that cannot be read or parsed, exits 1 (`fc-match <family>: <error>`).
 
@@ -169,13 +169,13 @@ Pixels are premultiplied, bytes B, G, R, A (`wl_shm` ARGB8888), each channel ⌊
 - **One surface per monitor.** A dragged thumbnail has one surface on every monitor it touches, each at the same layout position (margins may be negative), each receiving every present, recommit, chrome draw and alpha change; its chrome is drawn at its monitor's scale. A surface created by a drag or at the drop starts at the full alpha factor, one created by a key change at the record's current opacity (the base opacity, or full while the thumbnail is hovered); the chrome is drawn at once, and presents the last presented buffer at its configure, before anything else is attached. A surface whose monitor the thumbnail no longer touches is destroyed at once. At the drop the surface on the landing monitor stays and the others are destroyed; a landing surface not yet configured takes over at its configure, after it presents the last presented buffer. A key change that moves the record to another monitor works the same way, with one surface created there.
 - **Destroy, in this order.** Alpha object; chrome viewport, subsurface and surface; chrome buffer (at once, or at its release while the compositor holds it) and pool; layer viewport; layer role, then its `wl_surface` (sctk's order). Teardown and shutdown destroy every surface of a thumbnail before its buffers.
 
-**Boundary.** Only `main` calls it. In: the dmabuf `wl_buffer`s, buffer and thumbnail sizes, positions, `y_invert`, alpha factors, and a draw callback that runs `chrome`. Out: surface requests to the compositor, and the layer `wl_surface` that `main` uses to route pointer events and configures to the client.
+**Boundary.** Only `app` calls it. In: the dmabuf `wl_buffer`s, buffer and thumbnail sizes, positions, `y_invert`, alpha factors, and a draw callback that runs `chrome`. Out: surface requests to the compositor, and the layer `wl_surface` that `app` uses to route pointer events and configures to the client.
 
 **Failure.** `OverlayError` (input region, pool, chrome buffer, chrome attach) exits 1. A layer `closed` event exits 1 with `overlay closed by compositor`. A monitor without a `wl_output` at creation exits 1 with `no wl_output named <name>`.
 
 ### `protocol`
 
-wayland-scanner generates client bindings at build time from the in-tree hyprland-toplevel-export-v1 protocol XML (manager and frame interfaces, version 2). Its version 2 request names `zwlr_foreign_toplevel_handle_v1`, so the generated module imports wayland-protocols-wlr's foreign-toplevel interfaces. `main`, the module's only user, binds `hyprland_toplevel_export_manager_v1` at versions 1 to 2 and sends `capture_toplevel` and, at shutdown, the manager's `destroy`, both version 1 requests. Every other protocol comes from the wayland-protocols (`staging` feature for alpha-modifier), wayland-protocols-wlr and smithay-client-toolkit crates; versions are in the overview's interface table. The generated interface tables are statics with raw C-interface pointers and an `unsafe impl Sync`, so this module allows `unsafe_code` and silences lints, while the crate root denies `unsafe_code` everywhere else.
+wayland-scanner generates client bindings at build time from the in-tree hyprland-toplevel-export-v1 protocol XML (manager and frame interfaces, version 2). Its version 2 request names `zwlr_foreign_toplevel_handle_v1`, so the generated module imports wayland-protocols-wlr's foreign-toplevel interfaces. `app`, the module's only user, binds `hyprland_toplevel_export_manager_v1` at versions 1 to 2 and sends `capture_toplevel` and, at shutdown, the manager's `destroy`, both version 1 requests. Every other protocol comes from the wayland-protocols (`staging` feature for alpha-modifier), wayland-protocols-wlr and smithay-client-toolkit crates; versions are in the overview's interface table. The generated interface tables are statics with raw C-interface pointers and an `unsafe impl Sync`, so this module allows `unsafe_code` and silences lints, while the crate root denies `unsafe_code` everywhere else.
 
 ## Invariants
 

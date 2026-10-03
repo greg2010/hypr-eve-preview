@@ -12,16 +12,18 @@ The control plane carries lock, hide, snap, opacity and quit requests into the d
 sequenceDiagram
   participant U as shell or keybind
   participant M as main
+  participant A as app (run_command)
   participant C as control::send
   participant D as daemon
   U->>M: hypr-eve-preview <word> [<N>]
   M->>M: cli::parse_os gives Command
-  M->>M: ipc::sockets gives the socket path
-  M->>C: send(path, command)
+  M->>A: run_command(command)
+  A->>A: ipc::sockets gives the socket path
+  A->>C: send(path, command)
   C->>D: connect, "<line>\n"
   D-->>C: one reply line, then EOF
-  C-->>M: Ok or ClientError
-  M-->>U: exit 0, or exit line and exit 1
+  C-->>A: Ok or ClientError
+  A-->>U: exit 0, or exit line and exit 1
 ```
 
 1. `main` parses the arguments before anything else. `cli` returns a command only when the first argument is a fieldless command word with nothing after it, or `opacity` with exactly one valid value after it.
@@ -45,7 +47,7 @@ A busy daemon writes its refusal and closes without reading the request. The req
 ```mermaid
 sequenceDiagram
   participant P as peer
-  participant A as main (App)
+  participant A as app (App)
   participant S as control::Server
   P->>S: connect (queued on the listener)
   A->>S: listener readable: accept
@@ -60,12 +62,12 @@ sequenceDiagram
   A->>A: drain loop, remove source and timer
 ```
 
-- **Listener.** `main` watches a duplicate of the listener descriptor in a level-mode read source. Its callback calls `accept`, which takes connections until `WouldBlock`. Each connection becomes non-blocking. While 8 are open, the new one is answered `error: busy` and shut down at once, unread, and `main` prints `control-error error="busy"`. Otherwise it gets the next id, a duplicate descriptor for `main` and a deadline of accept time plus 1 s.
-- **Accept errors.** `accept` stops at the first error other than `Interrupted` (a failed `set_nonblocking` or duplicate of the new stream included, which drops that stream) and returns it with the admissions so far. `main` prints `control-error error="accept: <error>"`, disables the listener source and re-enables it from a 100 ms timer. A failed insert of that timer, or a failed re-enable when it fires, stops the daemon with code 1 and reason `event loop: <e>`.
-- **Per connection.** `main` inserts a level-mode read source on the duplicate and a timer at the deadline. A failed insert prints `accept: <error>` and closes the connection.
-- **Apply and reply.** A complete command goes to `main`'s `apply_command` with source `socket`, which owns what the change does. When the toggles change and a tray exists, `apply_command` runs `Tray::set_state` before it returns. The reply `ok` follows.
+- **Listener.** `app` watches a duplicate of the listener descriptor in a level-mode read source. Its callback calls `accept`, which takes connections until `WouldBlock`. Each connection becomes non-blocking. While 8 are open, the new one is answered `error: busy` and shut down at once, unread, and `app` prints `control-error error="busy"`. Otherwise it gets the next id, a duplicate descriptor for `app` and a deadline of accept time plus 1 s.
+- **Accept errors.** `accept` stops at the first error other than `Interrupted` (a failed `set_nonblocking` or duplicate of the new stream included, which drops that stream) and returns it with the admissions so far. `app` prints `control-error error="accept: <error>"`, disables the listener source and re-enables it from a 100 ms timer. A failed insert of that timer, or a failed re-enable when it fires, stops the daemon with code 1 and reason `event loop: <e>`.
+- **Per connection.** `app` inserts a level-mode read source on the duplicate and a timer at the deadline. A failed insert prints `accept: <error>` and closes the connection.
+- **Apply and reply.** A complete command goes to `app`'s `apply_command` with source `socket`, which owns what the change does. When the toggles change and a tray exists, `apply_command` runs `Tray::set_state` before it returns. The reply `ok` follows.
 
-| `read` outcome | `main` does | Reply | `control-error` |
+| `read` outcome | `app` does | Reply | `control-error` |
 |---|---|---|---|
 | `Pending` (no complete line) | waits for the next readable event | none | none |
 | `Line(Ok(command))` | applies, replies | `ok` | none |
@@ -77,7 +79,7 @@ sequenceDiagram
 
 Every outcome other than `Pending`, and the deadline, removes the connection's source and timer. A failed reply prints `reply: write: <e>; shutdown: <e>` with the parts present. Once a stop is pending, accept does nothing and a deadline does nothing; shutdown closes what remains without a reply.
 
-**The socket file.** `main` binds the server at startup. `Server::bind` first probes the path with a connect:
+**The socket file.** `app` binds the server at startup. `Server::bind` first probes the path with a connect:
 
 | Probe result | Action | Failure, as the exit reason |
 |---|---|---|
@@ -87,7 +89,7 @@ Every outcome other than `Pending`, and the deadline, removes the connection's s
 | Any other error | startup fails | `control socket <path>: connect: <error>` |
 | Bind or `set_nonblocking` fails | unlink after a `set_nonblocking` failure | `control socket <path>: bind: <error>` |
 
-The probe sends nothing and closes, so a running daemon reads EOF before any byte: `Closed`, no reply, no line. `Server::remove` shuts every open connection down without a reply, closes the listener and unlinks the path (`ENOENT` ignored); its errors join into one. `main` calls it from shutdown and from every startup failure after the bind, and a failure becomes the teardown text `control socket <path>: remove: <error>`. A killed daemon leaves the file, and the next start takes the `ECONNREFUSED` row.
+The probe sends nothing and closes, so a running daemon reads EOF before any byte: `Closed`, no reply, no line. `Server::remove` shuts every open connection down without a reply, closes the listener and unlinks the path (`ENOENT` ignored); its errors join into one. `exit`'s `remove_control` calls it, from `app`'s shutdown and startup failures and from `main`'s startup failures after the bind, and a failure becomes the teardown text `control socket <path>: remove: <error>`. A killed daemon leaves the file, and the next start takes the `ECONNREFUSED` row.
 
 ### The tray path
 
@@ -95,7 +97,7 @@ The probe sends nothing and closes, so a running daemon reads EOF before any byt
 sequenceDiagram
   participant H as tray host
   participant T as tray
-  participant A as main (App)
+  participant A as app (App)
   H->>T: Event(1, "clicked") on /MenuBar
   T->>T: queue Toggle(ToggleLock), reply, flush
   T-->>A: Pass [Command(Toggle(ToggleLock))]
@@ -121,13 +123,13 @@ sequenceDiagram
 | `RequestName` `org.kde.StatusNotifierItem-<pid>-1`, do-not-queue, 1 s; only primary owner counts | `name <name>: <error>`, `name <name>: reply code <n>` | none |
 | `AddMatch` for the watcher's `NameOwnerChanged`, 1 s | `match rule: <error>` | none |
 | `RegisterStatusNotifierItem(name)` on the watcher, 1 s; success prints `tray-registered` | `register: <error name>: <message>` | up, waits for a watcher |
-| `main` inserts the fd source and the drain ping | `watch: <error>`, `watch: dup: <e>` | ends |
+| `app` inserts the fd source and the drain ping | `watch: <error>`, `watch: dup: <e>` | ends |
 | Watcher gets an owner; its register reply is an error | `register: <error name>: <message>` | up |
 | Watcher leaves the bus | `StatusNotifierWatcher left the bus` | up, waits |
 | Pass 16 of a drain loop still has a command or `more` | `drain: 16 passes` | up |
 | A pass or `set_state` fails to read or send, or finds the connection down | `session bus: disconnected` | ends |
 
-"None" means no `Tray` exists for the rest of the run. "Ends" means `main` removes the fd source and the ping and drops the `Tray`. No row stops the daemon: the dbus crate turns off libdbus's exit-on-disconnect, and the tray has no path to a stop except `Quit`. There is no reconnection. At shutdown `main` removes the fd source and the ping, then drops the `Tray`; the drop closes the private connection, and the bus releases the name with it.
+"None" means no `Tray` exists for the rest of the run. "Ends" means `app` removes the fd source and the ping and drops the `Tray`. No row stops the daemon: the dbus crate turns off libdbus's exit-on-disconnect, and the tray has no path to a stop except `Quit`. There is no reconnection. At shutdown `app` removes the fd source and the ping, then drops the `Tray`; the drop closes the private connection, and the bus releases the name with it.
 
 **Watcher and registration.** The match rule selects `NameOwnerChanged` signals from the bus daemon with arg0 `org.kde.StatusNotifierWatcher`. A non-empty new owner (a watcher that appears or is replaced) makes the pass send `RegisterStatusNotifierItem` without blocking and record the call's serial with that owner's unique name, replacing any earlier record. An empty new owner reports the watcher's departure and changes nothing else. A method return or error is the register reply only when its reply serial is the recorded one and its sender is the recorded owner or the bus daemon (which answers when the destination is missing or leaves without a reply); it clears the record and reports `tray-registered` or `tray-unavailable`. The tray keeps no registered flag; the reports are the only trace.
 
@@ -168,7 +170,7 @@ Where a row does not say otherwise, an unknown id is an `InvalidArgs` error with
 
 `more` exists because libdbus reads incoming messages while it flushes and during its blocking calls. A message read that way waits in libdbus's queue and leaves the socket unreadable, so the level-mode fd source does not fire for it. While `more` is true, another pass may find such messages.
 
-**The bus fd.** calloop's `Generic` source needs an owned descriptor, the crate root denies `unsafe`, and libdbus exposes its watch only as a raw fd number. `pidfd_open` on the daemon's own pid, then `pidfd_getfd` of that number, gives an owned duplicate without `unsafe` (rustix feature `process`, Linux only). The watch must be enabled first, because the dbus crate panics on a watch query otherwise. `source()` hands `main` a further duplicate for a level-mode read source. libdbus closes its own socket when the connection drops, inside whichever call notices it; the source's duplicate stays valid until calloop unregisters and drops it.
+**The bus fd.** calloop's `Generic` source needs an owned descriptor, the crate root denies `unsafe`, and libdbus exposes its watch only as a raw fd number. `pidfd_open` on the daemon's own pid, then `pidfd_getfd` of that number, gives an owned duplicate without `unsafe` (rustix feature `process`, Linux only). The watch must be enabled first, because the dbus crate panics on a watch query otherwise. `source()` hands `app` a further duplicate for a level-mode read source. libdbus closes its own socket when the connection drops, inside whichever call notices it; the source's duplicate stays valid until calloop unregisters and drops it.
 
 ## Components
 
@@ -191,11 +193,11 @@ Where a row does not say otherwise, an unknown id is an `InvalidArgs` error with
 | `opacity <N>` | `opacity` N |
 
 - **Line reader.** It collects bytes until `\n`, which classifies the line with `Command::parse`, or until the 65th byte, which is `TooLong`. EOF after bytes classifies what arrived; EOF with nothing is no line. Bytes after the line are ignored.
-- **Server.** `read` asks only for the reader's remaining room and stops at `WouldBlock`, a complete line or EOF; after a line it reads nothing more from that connection. `reply` is one non-blocking write of the whole reply (a short write is an error), then `shutdown(Both)`, then the stream is dropped. `timeout` is `reply` with `timeout`; `close` shuts down without a reply. Every close shuts the socket down because `main`'s source still holds a duplicate descriptor until it removes the source; the shutdown makes the peer read EOF at once.
+- **Server.** `read` asks only for the reader's remaining room and stops at `WouldBlock`, a complete line or EOF; after a line it reads nothing more from that connection. `reply` is one non-blocking write of the whole reply (a short write is an error), then `shutdown(Both)`, then the stream is dropped. `timeout` is `reply` with `timeout`; `close` shuts down without a reply. Every close shuts the socket down because `app`'s source still holds a duplicate descriptor until it removes the source; the shutdown makes the peer read EOF at once.
 - **Client half.** `send` is the whole command-form exchange described above. It shares the words and the reply texts with the server and holds no state.
 - **Refusals.** `Empty`, `Unknown`, `TooLong`, `Timeout`, `Busy`, `BadValue` (`error: bad value`). `Display` is cut from the reply text, so reason and reply cannot drift, and `send` matches replies by walking the set along the `Refusal::next` successor chain. A new refusal must be linked into `Refusal::next` as the new last element, else `send` reports its reply as `unexpected reply`; a unit test pins the chain.
 - **Slow or silent peers.** Nothing blocks: listener and streams are non-blocking, and a reply is one write that is never retried. A peer that never ends its line gets `error: timeout` 1 s after accept, however slowly it sends. A peer that never reads its reply costs one write attempt; a failure is reported and the connection closed. The ninth concurrent connection is refused at accept, unread.
-- **Boundary.** In: peer bytes, and calls from `main` (`bind`, `listener_fd`, `accept`, `read`, `reply`, `timeout`, `close`, `remove`, `send`). Out: admissions and read outcomes carrying a command or a refusal, and error values. It never touches the event loop and prints nothing: `main` owns every source and timer and prints every line. `tray` uses `Command` and `Toggles`; `cli` uses `Command`. `report` builds the `usage` syntax from `COMMANDS` (usage order) and `OPACITY_WORD`; it writes the `opacity <N>` form by hand after the fieldless words. From `config` it takes only `MAX_OPACITY`.
+- **Boundary.** In: peer bytes, and calls from `app` (`bind`, `listener_fd`, `accept`, `read`, `reply`, `timeout`, `close`, `send`) and from `exit` (`remove`). Out: admissions and read outcomes carrying a command or a refusal, and error values. It never touches the event loop and prints nothing: `app` owns every source and timer except the signal source, which `main` inserts, and every line is printed by `app` or `exit`. `tray` uses `Command` and `Toggles`; `cli` uses `Command`. `report` builds the `usage` syntax from `COMMANDS` (usage order) and `OPACITY_WORD`; it writes the `opacity <N>` form by hand after the fieldless words. From `config` it takes only `MAX_OPACITY`.
 
 | Error | From | Shape |
 |---|---|---|
@@ -205,30 +207,30 @@ Where a row does not say otherwise, an unknown id is an `InvalidArgs` error with
 | `io::Error` | `close`, `remove` | the shutdown error; for `remove` every shutdown and unlink error in one, with the first error's kind |
 | `ClientError` | `send` | `Connect`, `Timeout`, `Io`, `Refused(reason)`, `BadReply` |
 
-- **Failure.** A bind error ends startup with exit 1. Every server error at runtime goes back to `main` as a value and becomes a `control-error` line; none stops the daemon. An event-loop error around the accept pause does (code 1, `event loop: <e>`). No shutdown error is dropped. A `send` error is the command form's `exit` reason.
+- **Failure.** A bind error ends startup with exit 1. Every server error at runtime goes back to `app` as a value and becomes a `control-error` line; none stops the daemon. An event-loop error around the accept pause does (code 1, `event loop: <e>`). No shutdown error is dropped. A `send` error is the command form's `exit` reason.
 
 ### `tray`
 
 - **State.** The private session-bus `Channel`; the dbus-crossroads object tree, whose `/StatusNotifierItem` data is the shown icon, the hidden icon and the hidden flag, and whose `/MenuBar` data is the menu state (toggles, revision, pending commands); the owned name; the outstanding register call (serial, watcher owner); the watch-fd duplicate.
 - **How.** Single-threaded: every call runs on `App`'s thread. The method handlers call pure functions over the menu state and only read it or append to its pending list; they never touch `App`. The entry points are `start` (the blocking setup), `drain` (one pass), `set_state` (mirror the toggles, then one pass), `defer` (put a command first, no bus I/O) and `source`.
 - **Sender checks.** A peer can send a `NameOwnerChanged` signal straight to the tray's unique name, which no match rule filters, and can send a method return or error that carries a guessed reply serial. The bus daemon stamps every message with its sender's unique name, so only the bus itself can appear as `org.freedesktop.DBus`. The tray therefore takes an owner change only when sender and interface are `org.freedesktop.DBus`, and a register reply only from the recorded owner or the bus. Without the checks a peer could make the tray register with an owner of its choice or fake the registration result.
-- **Boundary.** In from `main`: pid, toggles and `border.color` at start; toggles in `set_state`; deferred commands. In from the bus: method calls, watcher owner changes, register replies. Out to `main`: passes whose events are `Command(Toggle(c))`, `Command(Quit)`, `Registered` and `Unavailable(reason)`; `main` prints the last two as `tray-registered` and `tray-unavailable`. Out to the bus: method replies, the two menu signals, `NewIcon`, register calls. From `control` it uses `Command` and `Toggles`; from `config` only `Color`, for the icons.
-- **Failure.** A setup error before the register call is `Err` and leaves no tray. A failed register call is the inner `Err` and keeps the tray. A bus failure at runtime is `Err("session bus: disconnected")` from `drain` or `set_state`, and `main` ends the tray. Reasons are plain strings that become `tray-unavailable` lines.
+- **Boundary.** In from `app`: pid, toggles and `border.color` at start; toggles in `set_state`; deferred commands. In from the bus: method calls, watcher owner changes, register replies. Out to `app`: passes whose events are `Command(Toggle(c))`, `Command(Quit)`, `Registered` and `Unavailable(reason)`; `app` prints the last two as `tray-registered` and `tray-unavailable`. Out to the bus: method replies, the two menu signals, `NewIcon`, register calls. From `control` it uses `Command` and `Toggles`; from `config` only `Color`, for the icons.
+- **Failure.** A setup error before the register call is `Err` and leaves no tray. A failed register call is the inner `Err` and keeps the tray. A bus failure at runtime is `Err("session bus: disconnected")` from `drain` or `set_state`, and `app` ends the tray. Reasons are plain strings that become `tray-unavailable` lines.
 
 ### `cli`
 
 - **State.** None. It does no I/O.
 - **Grammar.** `parse_os` converts every argument to UTF-8 before any other rule; the first that fails is `argument <n> is not UTF-8` (1-based), even after a command word. A first argument that is a fieldless command word selects the command form. A first argument `opacity` selects it too and takes the next argument as its value: none is `opacity needs a value`, and one that is not 1 to 3 ASCII digits worth at most 100 is `invalid opacity "<v>": want 0 to 100`. Any argument after the command is `<command>: unexpected argument "<arg>"`. Otherwise the flags apply: `--config`, `--log` and `--seconds` take the next argument as their value whatever it looks like, `--verbose` and `--ignore-damage` take none, and each may occur once. `--seconds` parses as an unsigned decimal from 1 to 86400 (a leading `+` and leading zeros pass). Anything else is `unknown argument "<arg>"`: `--flag=value`, a positional, `--help`, or a command word after a flag (`--verbose snap` fails on `snap`).
 - **Boundary.** In: the arguments after argv[0], parsed first thing in `main`. Out: `Invocation::Daemon(Args)`, which continues startup in `main`, or `Invocation::Command(command)`, which `main` hands to `run_command`. From `control` it uses `Command::from_word`, `Command::opacity_value`, `Command::word` and `OPACITY_WORD`; from `config`, `MAX_OPACITY` in the `InvalidOpacity` text.
-- **Usage errors.** `UsageError` is `Unknown`, `MissingValue`, `Duplicate`, `InvalidSeconds`, `NotUtf8`, `InvalidOpacity` or `CommandArgument`; `Display` is the message. `main` prints the `usage` line, then the `exit` line with code 2, to stderr only, before it opens any file or socket.
+- **Usage errors.** `UsageError` is `Unknown`, `MissingValue`, `Duplicate`, `InvalidSeconds`, `NotUtf8`, `InvalidOpacity` or `CommandArgument`; `Display` is the message. `exit` prints, for `main`, the `usage` line, then the `exit` line with code 2, to stderr only, before any file or socket opens.
 
 ## Invariants
 
 - **One mapping from bytes to a command.** `Command::from_word` and `Command::opacity_value` serve the socket (through `Command::parse`) and the command line, so both accept exactly the same nine words and the same `opacity` values.
 - **A command is only ever the whole invocation.** It is the first argument, followed only by the value for `opacity`. A command word in another position, or another argument after the command, is a usage error, so no daemon flag reaches the command form.
-- **One request per connection.** After a line completes the server reads no more, and `main` replies or closes in the same callback.
+- **One request per connection.** After a line completes the server reads no more, and `app` replies or closes in the same callback.
 - **Bounded per connection.** At most 65 bytes held, a deadline 1 s after accept, at most 8 open connections; no read or reply blocks the loop.
-- **Every close shuts the socket down,** so the peer sees EOF while `main`'s duplicate descriptor is still registered.
+- **Every close shuts the socket down,** so the peer sees EOF while `app`'s duplicate descriptor is still registered.
 - **Fixed replies, no echo.** Replies are `ok` or the six refusal texts, and `control-error` carries a reason or an OS error, never received bytes.
 - **`ok` follows the apply.** The reply is written after `apply_command` and its `set_state` returned.
 - **No command after a stop.** `apply` returns its input, accept stops, a completed line is closed without a reply, and a deadline does nothing.
